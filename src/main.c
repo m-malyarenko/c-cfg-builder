@@ -2,40 +2,17 @@
 #include <stdio.h>
 
 #include <clang-c/Index.h>
+#include <ustring/str.h>
+
+#include "builder/cfg_builder.h"
+#include "entity/function.h"
 
 #define MAIN_ARGC ((int) 2)
 #define SRC_FILE_ARGV_IDX ((int) 1)
 
-enum CXChildVisitResult print_visitor(CXCursor cursor,
-                                      CXCursor parent,
-                                      CXClientData client_data)
-{
-    CXString kind_spelling =
-        clang_getCursorKindSpelling(clang_getCursorKind(cursor));
+VISITOR(find_tu_function);
 
-    CXString cursor_spelling = clang_getCursorSpelling(cursor);
-
-    printf("Kind: %s, Name: %s\n",
-        clang_getCString(kind_spelling),
-        clang_getCString(cursor_spelling)
-    );
-
-    clang_disposeString(kind_spelling);
-
-    return CXChildVisit_Recurse;
-}
-
-enum CXChildVisitResult find_tu_function(CXCursor cursor,
-                                         CXCursor parent,
-                                         CXClientData client_data)
-{
-    if (clang_getCursorKind(cursor) == CXCursor_FunctionDecl) {
-        *((CXCursor*) client_data) = cursor;
-        return CXVisit_Break;
-    } else {
-        return CXVisit_Continue;
-    }
-}
+VISITOR(print_visitor);
 
 int main(int argc, char* argv[]) {
     if (argc != MAIN_ARGC) {
@@ -78,8 +55,50 @@ int main(int argc, char* argv[]) {
 
     clang_visitChildren(function_cursor, print_visitor, NULL);
 
+    struct function f = build_function_cfg(function_cursor);
+
+    if (ENTITY_FUNCTION_IS_NULL(f)) {
+        fprintf(stderr, "Failed to build function CFG\n");
+        clang_disposeTranslationUnit(tu);
+        clang_disposeIndex(index);
+        return EXIT_FAILURE;
+    }
+
     clang_disposeTranslationUnit(tu);
     clang_disposeIndex(index);
 
     return EXIT_SUCCESS;
+}
+
+VISITOR(find_tu_function) {
+    if (clang_getCursorKind(cursor) == CXCursor_FunctionDecl) {
+        *((CXCursor*) client_data) = cursor;
+        return CXVisit_Break;
+    } else {
+        return CXVisit_Continue;
+    }
+}
+
+VISITOR(print_visitor) {
+    CXString kind_spelling =
+        clang_getCursorKindSpelling(clang_getCursorKind(cursor));
+
+    CXString cursor_spelling = clang_getCursorSpelling(cursor);
+
+    str_t* parent_ident = client_data;
+    str_t* ident = str_copy(parent_ident);
+    str_append(ident, "\t");
+
+    printf("%sKind: %s, Name: %s\n",
+        str_as_ptr(ident),
+        clang_getCString(kind_spelling),
+        clang_getCString(cursor_spelling)
+    );
+
+    clang_visitChildren(cursor, print_visitor, ident);
+
+    clang_disposeString(kind_spelling);
+    str_drop(&ident);
+
+    return CXChildVisit_Continue;
 }
