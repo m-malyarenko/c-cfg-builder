@@ -1,12 +1,17 @@
-#ifndef __CFG_FUNCTION_H__
-#define __CFG_FUNCTION_H__
+#ifndef __ENTITY_FUNCTION_H__
+#define __ENTITY_FUNCTION_H__
 
-#include "operation.h"
 #include "basic_block.h"
 
 struct function {
     struct basic_block* source;
-    struct basic_block* sink;
+    struct basic_block* const sink;
 };
 
-#endif /* __CFG_FUNCTION_H__ */
+#define ENTITY_FUNCTION_NULL() ((struct function) {NULL, NULL})
+
+#define ENTITY_FUNCTION_IS_NULL(f) (((f).sink == NULL) && ((f).source == NULL))
+
+#define ENTITY_FUNCTION_NEW() ((struct function) { .source = basic_block_new(), .sink = NULL })
+
+#endif /* __ENTITY_FUNCTION_H__ */
