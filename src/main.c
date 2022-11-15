@@ -25,6 +25,18 @@ enum CXChildVisitResult print_visitor(CXCursor cursor,
     return CXChildVisit_Recurse;
 }
 
+enum CXChildVisitResult find_tu_function(CXCursor cursor,
+                                         CXCursor parent,
+                                         CXClientData client_data)
+{
+    if (clang_getCursorKind(cursor) == CXCursor_FunctionDecl) {
+        *((CXCursor*) client_data) = cursor;
+        return CXVisit_Break;
+    } else {
+        return CXVisit_Continue;
+    }
+}
+
 int main(int argc, char* argv[]) {
     if (argc != MAIN_ARGC) {
         fprintf(stderr, "Incorrect number of arguments\n");
@@ -53,10 +65,21 @@ int main(int argc, char* argv[]) {
 
     CXCursor root_cursor = clang_getTranslationUnitCursor(tu);
 
-    clang_visitChildren(root_cursor, print_visitor, NULL);
+    CXCursor function_cursor;
+    const int visit_status =
+        clang_visitChildren(root_cursor, find_tu_function, &function_cursor);
+
+    if (visit_status == 0) {
+        fprintf(stderr, "No function found in translation unit\n");
+        clang_disposeTranslationUnit(tu);
+        clang_disposeIndex(index);
+        return EXIT_FAILURE;
+    }
+
+    clang_visitChildren(function_cursor, print_visitor, NULL);
 
     clang_disposeTranslationUnit(tu);
     clang_disposeIndex(index);
 
-    return 0;
+    return EXIT_SUCCESS;
 }
