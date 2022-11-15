@@ -1,11 +1,12 @@
-#ifndef __CFG_BASIC_BLOCK_H__
-#define __CFG_BASIC_BLOCK_H__
+#ifndef __ENTITY_BASIC_BLOCK_H__
+#define __ENTITY_BASIC_BLOCK_H__
 
 #include <stddef.h>
 
 #include "operation.h"
 
-#define BASIC_BLOCK_LINKS_DEFAULT_CAP ((size_t) 2)
+#define BB_LINKS_DEFAULT_CAP ((size_t) 2)
+#define BB_OPERATIONS_DEFAULT_CAP ((size_t) 2)
 
 struct basic_block {
     struct {
@@ -21,4 +22,18 @@ struct basic_block {
     } links;
 };
 
-#endif /* __CFG_BASIC_BLOCK_H__ */
+struct basic_block* basic_block_new();
+
+void basic_block_drop(struct basic_block** self);
+
+void basic_block_push_operation(struct basic_block* self, struct operation* op);
+
+void basic_block_push_link(struct basic_block* self, struct basic_block* bb);
+
+void basic_block_insert_link(struct basic_block* self, struct basic_block* bb, size_t idx);
+
+void basic_block_resize_links(struct basic_block* self, size_t new_size);
+
+struct basic_block* basic_block_split_end(struct basic_block* self);
+
+#endif /* __ENTITY_BASIC_BLOCK_H__ */
