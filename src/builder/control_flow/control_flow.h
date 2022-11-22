@@ -13,6 +13,14 @@
 
 struct control_flow;
 
+struct control_flow_empty {
+    struct basic_block** ancestor_link;
+};
+
+struct control_flow_linear {
+    struct basic_block* body;
+};
+
 struct control_flow_if {
     struct basic_block* cond;
     struct control_flow* body;
@@ -54,7 +62,8 @@ struct control_flow {
     enum control_flow_type type;
     struct basic_block* entry;
     union {
-        void* cf_linear;
+        struct control_flow_empty* cf_empty;
+        struct control_flow_linear* cf_linear;
         struct control_flow_if* cf_if;
         struct control_flow_if_else* cf_if_else;
         struct control_flow_while* cf_while;
@@ -62,12 +71,22 @@ struct control_flow {
         struct control_flow_for* cf_for;
         struct control_flow_switch* cf_switch;
     } pattern;
-    struct basic_block* exit;
+    struct control_flow* next;
 };
 
-struct control_flow* control_flow_new(enum control_flow_type type,
-                                      struct basic_block* entry,
-                                      struct basic_block* exit);
+struct control_flow* control_flow_new(enum control_flow_type type, struct control_flow* next);
+
+void control_flow_drop(struct control_flow** self);
+
+struct control_flow* control_flow_create_successor(struct control_flow* self, enum control_flow_type successor_type);
+
+void control_flow_connect_tail_recursive(struct control_flow* self, struct basic_block* target);
+
+struct control_flow* control_flow_search_in_chain(struct control_flow* first, struct control_flow* target_next);
+
+struct control_flow_empty* control_flow_create_pattern_empty(const struct control_flow* self);
+
+struct control_flow_linear* control_flow_create_pattern_linear(const struct control_flow* self);
 
 struct control_flow_if* control_flow_create_pattern_if(const struct control_flow* self);
 
