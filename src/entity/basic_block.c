@@ -6,6 +6,8 @@
 struct basic_block* basic_block_new() {
     struct basic_block* new_basic_block = malloc(sizeof(struct basic_block));
 
+    new_basic_block->tmp_count = 0;
+
     new_basic_block->links.cap = BB_LINKS_DEFAULT_CAP;
     new_basic_block->links.len = 0;
     new_basic_block->links.buffer =
@@ -29,11 +31,19 @@ void basic_block_drop(struct basic_block** self) {
     }
 
     if ((*self)->operations.buffer != NULL) {
+        for (size_t i = 0; i < (*self)->operations.len; i++) {
+            operation_drop(&(*self)->operations.buffer[i]);
+        }
+
         free((*self)->operations.buffer);
     }
 
     free(*self);
     *self = NULL;
+}
+
+bool basic_block_is_empty(const struct basic_block* self) {
+    return (self == NULL) ? true : (self->operations.len == 0);
 }
 
 void basic_block_push_operation(struct basic_block* self, struct operation* op) {
@@ -67,7 +77,7 @@ void basic_block_push_link(struct basic_block* self, struct basic_block* bb) {
 }
 
 void basic_block_insert_link(struct basic_block* self, struct basic_block* bb, size_t idx) {
-    if ((self == NULL) || (bb == NULL)) {
+    if (self == NULL) {
         return;
     }
 
@@ -119,7 +129,19 @@ struct basic_block* basic_block_split_end(struct basic_block* self) {
     }
 
     basic_block_resize_links(self, 1);
-    basic_block_push_link(self, new_basic_block);
+    basic_block_insert_link(self, new_basic_block, 0);
 
     return new_basic_block; 
+}
+
+unsigned short basic_block_get_tmp_count(const struct basic_block* self) {
+    return (self == NULL) ? 0 : self->tmp_count;
+}
+
+void basic_block_increment_tmp_count(struct basic_block* self) {
+    if (self == NULL) {
+        return;
+    }
+
+    self->tmp_count += 1;
 }
