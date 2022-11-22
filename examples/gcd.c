@@ -1,5 +1,5 @@
 int gcd(int a, int b) {
-    int r;
+    int r = 0;
 
     while ((a % b) > 0) {
         r = a % b;
