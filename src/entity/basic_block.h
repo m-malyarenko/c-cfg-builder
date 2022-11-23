@@ -6,12 +6,9 @@
 
 #include "operation.h"
 
-#define BB_LINKS_DEFAULT_CAP ((size_t) 2)
-#define BB_OPERATIONS_DEFAULT_CAP ((size_t) 2)
+#define BB_OPERATIONS_DEFAULT_CAP ((size_t) 1)
 
 struct basic_block {
-    unsigned short tmp_count;
-
     struct {
         struct operation** buffer;
         size_t len;
@@ -33,16 +30,10 @@ bool basic_block_is_empty(const struct basic_block* self);
 
 void basic_block_push_operation(struct basic_block* self, struct operation* op);
 
-void basic_block_push_link(struct basic_block* self, struct basic_block* bb);
-
-void basic_block_insert_link(struct basic_block* self, struct basic_block* bb, size_t idx);
-
 void basic_block_resize_links(struct basic_block* self, size_t new_size);
 
+void basic_block_set_link(struct basic_block* self, struct basic_block* bb, size_t idx);
+
 struct basic_block* basic_block_split_end(struct basic_block* self);
-
-unsigned short basic_block_get_tmp_count(const struct basic_block* self);
-
-void basic_block_increment_tmp_count(struct basic_block* self);
 
 #endif /* __ENTITY_BASIC_BLOCK_H__ */
