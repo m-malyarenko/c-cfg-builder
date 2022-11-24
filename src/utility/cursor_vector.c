@@ -8,7 +8,7 @@ struct cursor_vector* cursor_vector_new() {
     struct cursor_vector* new_children_vector =
         malloc(sizeof(struct cursor_vector));
 
-    new_children_vector->cap = UTILITY_CHILDREN_VECTOR_DEVAULT_CAP;
+    new_children_vector->cap = UTILITY_CHILDREN_VECTOR_DEFAULT_CAP;
     new_children_vector->buffer =
         malloc(new_children_vector->cap * sizeof(CXCursor));
     new_children_vector->len = 0;

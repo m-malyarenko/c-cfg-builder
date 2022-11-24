@@ -5,7 +5,7 @@
 
 #include <clang-c/Index.h>
 
-#define UTILITY_CHILDREN_VECTOR_DEVAULT_CAP ((size_t) 3)
+#define UTILITY_CHILDREN_VECTOR_DEFAULT_CAP ((size_t) 3)
 
 struct cursor_vector {
     CXCursor* buffer;

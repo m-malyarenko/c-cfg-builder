@@ -13,36 +13,36 @@ struct control_flow* control_flow_new(enum control_flow_type type, struct contro
     cf_new->next = next;
 
     switch (type) {
-        case CONTROL_FLOW_LINEAR: {
+        case CF_LINEAR: {
             cf_new->pattern.cf_linear = control_flow_create_pattern_linear(cf_new);
             cf_new->entry = cf_new->pattern.cf_linear->body;
         } break;
-        case CONTROL_FLOW_IF: {
+        case CF_IF: {
             cf_new->pattern.cf_if = control_flow_create_pattern_if(cf_new);
             cf_new->entry = cf_new->pattern.cf_if->cond;
         } break;
-        case CONTROL_FLOW_IF_ELSE: {
+        case CF_IF_ELSE: {
             cf_new->pattern.cf_if_else = control_flow_create_pattern_if_else(cf_new);
             cf_new->entry = cf_new->pattern.cf_if_else->cond;
         } break;
-        case CONTROL_FLOW_WHILE: {
+        case CF_WHILE: {
             cf_new->pattern.cf_while = control_flow_create_pattern_while(cf_new);
             cf_new->entry = cf_new->pattern.cf_while->cond;
         } break;
-        case CONTROL_FLOW_DO_WHILE: {
+        case CF_DO_WHILE: {
             cf_new->pattern.cf_do_while = control_flow_create_pattern_do_while(cf_new);
             cf_new->entry = cf_new->pattern.cf_do_while->body->entry;
         } break;
-        case CONTROL_FLOW_FOR: {
+        case CF_FOR: {
             cf_new->pattern.cf_for = control_flow_create_pattern_for(cf_new);
             cf_new->entry = cf_new->pattern.cf_for->init;
         } break;
-        case CONTROL_FLOW_SWITCH: {
+        case CF_SWITCH: {
             cf_new->pattern.cf_switch = control_flow_create_pattern_switch(cf_new);
             // TODO Switch control flow
         } break;
         default:
-        case CONTROL_FLOW_EMPTY: {
+        case CF_EMPTY: {
             cf_new->pattern.cf_empty = control_flow_create_pattern_empty(cf_new);
             cf_new->entry = (next == NULL) ? NULL : next->entry; // NOTE: Ancestor link must be set by caller
         } break;
@@ -52,6 +52,10 @@ struct control_flow* control_flow_new(enum control_flow_type type, struct contro
 }
 
 void control_flow_drop(struct control_flow** self) {
+    if ((self == NULL) || (*self == NULL)) {
+        return;
+    }
+
     // TODO Implement
 }
 
@@ -75,11 +79,11 @@ void control_flow_connect_tail_recursive(struct control_flow* self, struct basic
     assert(self != NULL);
 
     switch (self->type) {
-        case CONTROL_FLOW_LINEAR: {
-            basic_block_insert_link(self->pattern.cf_linear->body, target, 0);
+        case CF_LINEAR: {
+            basic_block_set_link(self->pattern.cf_linear->body, target, 0);
         } break;
-        case CONTROL_FLOW_IF: {
-            basic_block_insert_link(self->pattern.cf_if->cond, target, CF_FALSE_BRANCH_LINK_IDX);
+        case CF_IF: {
+            basic_block_set_link(self->pattern.cf_if->cond, target, CF_FALSE_BRANCH_LINK_IDX);
 
             struct control_flow* last_in_branch =
                 control_flow_search_in_chain(self->pattern.cf_if->body, self->next);
@@ -87,7 +91,7 @@ void control_flow_connect_tail_recursive(struct control_flow* self, struct basic
 
             control_flow_connect_tail_recursive(last_in_branch, target);
         } break;
-        case CONTROL_FLOW_IF_ELSE: {
+        case CF_IF_ELSE: {
             struct control_flow* last_in_true_branch =
                 control_flow_search_in_chain(self->pattern.cf_if_else->body_true, self->next);
             assert(last_in_true_branch != NULL);
@@ -99,16 +103,16 @@ void control_flow_connect_tail_recursive(struct control_flow* self, struct basic
             control_flow_connect_tail_recursive(last_in_true_branch, target);
             control_flow_connect_tail_recursive(last_in_false_branch, target);
         } break;
-        case CONTROL_FLOW_WHILE: {
-            basic_block_insert_link(self->pattern.cf_while->cond, target, CF_FALSE_BRANCH_LINK_IDX);
+        case CF_WHILE: {
+            basic_block_set_link(self->pattern.cf_while->cond, target, CF_FALSE_BRANCH_LINK_IDX);
         } break;
-        case CONTROL_FLOW_DO_WHILE: {
-            basic_block_insert_link(self->pattern.cf_do_while->cond, target, CF_FALSE_BRANCH_LINK_IDX);
+        case CF_DO_WHILE: {
+            basic_block_set_link(self->pattern.cf_do_while->cond->entry, target, CF_FALSE_BRANCH_LINK_IDX);
         } break;
-        case CONTROL_FLOW_FOR: {
-            basic_block_insert_link(self->pattern.cf_for->cond, target, CF_FALSE_BRANCH_LINK_IDX);
+        case CF_FOR: {
+            basic_block_set_link(self->pattern.cf_for->cond, target, CF_FALSE_BRANCH_LINK_IDX);
         } break;
-        case CONTROL_FLOW_SWITCH: {
+        case CF_SWITCH: {
             for (size_t i = 0; i < self->pattern.cf_switch->branches.len; i++) {
                 struct control_flow* branch_flow =
                     self->pattern.cf_switch->branches.branch_bodies[i];
@@ -121,7 +125,7 @@ void control_flow_connect_tail_recursive(struct control_flow* self, struct basic
             }
         } break;
         default:
-        case CONTROL_FLOW_EMPTY: {
+        case CF_EMPTY: {
             self->entry = target;
             if (self->pattern.cf_empty->ancestor_link != NULL) {
                 *(self->pattern.cf_empty->ancestor_link) = self->entry;
@@ -163,11 +167,11 @@ struct control_flow_linear* control_flow_create_pattern_linear(const struct cont
     }
 
     struct control_flow_linear* pattern = malloc(sizeof(struct control_flow_linear));
-    struct basic_block* next_entry = (self->next == NULL) ? NULL : self->next->entry;
+    struct basic_block* const next_entry = (self->next == NULL) ? NULL : self->next->entry;
 
     pattern->body = basic_block_new();
     basic_block_resize_links(pattern->body, 1);
-    basic_block_insert_link(pattern->body, next_entry, 0);
+    basic_block_set_link(pattern->body, next_entry, 0);
 
     return pattern;
 }
@@ -178,13 +182,14 @@ struct control_flow_if* control_flow_create_pattern_if(const struct control_flow
     }
 
     struct control_flow_if* pattern = malloc(sizeof(struct control_flow_if));
-    struct basic_block* next_entry = (self->next == NULL) ? NULL : self->next->entry;
+    struct basic_block* const next_entry = (self->next == NULL) ? NULL : self->next->entry;
 
     pattern->cond = basic_block_new();
+    pattern->body = control_flow_new(CF_EMPTY, self->next);
+
     basic_block_resize_links(pattern->cond, 2);
-    basic_block_insert_link(pattern->cond, pattern->body->entry, CF_TRUE_BRANCH_LINK_IDX);
-    basic_block_insert_link(pattern->cond, self->next->entry, CF_FALSE_BRANCH_LINK_IDX);
-    pattern->body = control_flow_new(CONTROL_FLOW_EMPTY, self->next);
+    basic_block_set_link(pattern->cond, pattern->body->entry, CF_TRUE_BRANCH_LINK_IDX);
+    basic_block_set_link(pattern->cond, next_entry, CF_FALSE_BRANCH_LINK_IDX);
 
     pattern->body->pattern.cf_empty->ancestor_link =
         &pattern->cond->links.buffer[CF_TRUE_BRANCH_LINK_IDX];
@@ -200,12 +205,12 @@ struct control_flow_if_else* control_flow_create_pattern_if_else(const struct co
     struct control_flow_if_else* pattern = malloc(sizeof(struct control_flow_if_else));
 
     pattern->cond = basic_block_new();
-    pattern->body_true = control_flow_new(CONTROL_FLOW_EMPTY, self->next);
-    pattern->body_false = control_flow_new(CONTROL_FLOW_EMPTY, self->next);
+    pattern->body_true = control_flow_new(CF_EMPTY, self->next);
+    pattern->body_false = control_flow_new(CF_EMPTY, self->next);
 
     basic_block_resize_links(pattern->cond, 2);
-    basic_block_insert_link(pattern->cond, pattern->body_true->entry, CF_TRUE_BRANCH_LINK_IDX);
-    basic_block_insert_link(pattern->cond, pattern->body_false->entry, CF_FALSE_BRANCH_LINK_IDX);
+    basic_block_set_link(pattern->cond, pattern->body_true->entry, CF_TRUE_BRANCH_LINK_IDX);
+    basic_block_set_link(pattern->cond, pattern->body_false->entry, CF_FALSE_BRANCH_LINK_IDX);
 
     pattern->body_true->pattern.cf_empty->ancestor_link =
         &pattern->cond->links.buffer[CF_TRUE_BRANCH_LINK_IDX];
@@ -225,11 +230,11 @@ struct control_flow_while* control_flow_create_pattern_while(const struct contro
     struct basic_block* next_entry = (self->next == NULL) ? NULL : self->next->entry;
 
     pattern->cond = basic_block_new();
-    pattern->body = control_flow_new(CONTROL_FLOW_EMPTY, self->next);
+    pattern->body = control_flow_new(CF_EMPTY, self); // FIXME Const discard
 
     basic_block_resize_links(pattern->cond, 2);
-    basic_block_insert_link(pattern->cond, pattern->body->entry, CF_TRUE_BRANCH_LINK_IDX);
-    basic_block_insert_link(pattern->cond, next_entry, CF_FALSE_BRANCH_LINK_IDX);
+    basic_block_set_link(pattern->cond, pattern->body->entry, CF_TRUE_BRANCH_LINK_IDX);
+    basic_block_set_link(pattern->cond, next_entry, CF_FALSE_BRANCH_LINK_IDX);
 
     pattern->body->pattern.cf_empty->ancestor_link =
         &pattern->cond->links.buffer[CF_TRUE_BRANCH_LINK_IDX];
@@ -245,15 +250,12 @@ struct control_flow_do_while* control_flow_create_pattern_do_while(const struct 
     struct control_flow_do_while* pattern = malloc(sizeof(struct control_flow_do_while));
     struct basic_block* next_entry = (self->next == NULL) ? NULL : self->next->entry;
 
-    pattern->cond = basic_block_new();
-    pattern->body = control_flow_new(CONTROL_FLOW_EMPTY, self->next);
+    pattern->cond = control_flow_new(CF_LINEAR, NULL);
+    pattern->body = control_flow_new(CF_LINEAR, pattern->cond); // FIXME Do loop
 
-    basic_block_resize_links(pattern->cond, 2);
-    basic_block_insert_link(pattern->cond, pattern->body->entry, CF_TRUE_BRANCH_LINK_IDX);
-    basic_block_insert_link(pattern->cond, next_entry, CF_FALSE_BRANCH_LINK_IDX);
-
-    pattern->body->pattern.cf_empty->ancestor_link =
-        &pattern->cond->links.buffer[CF_TRUE_BRANCH_LINK_IDX];
+    basic_block_resize_links(pattern->cond->entry, 2);
+    basic_block_set_link(pattern->cond->entry, pattern->body->entry, CF_TRUE_BRANCH_LINK_IDX);
+    basic_block_set_link(pattern->cond->entry, next_entry, CF_FALSE_BRANCH_LINK_IDX);
 
     return pattern;
 }
@@ -268,28 +270,27 @@ struct control_flow_for* control_flow_create_pattern_for(const struct control_fl
 
     pattern->init = basic_block_new();
     pattern->cond = basic_block_new();
-    pattern->iter = basic_block_new();
 
-    /* Create special body control flow */
+    /* Iteration block */
+    pattern->iter = control_flow_new(CF_LINEAR, NULL);
+    basic_block_resize_links(pattern->iter->entry, 1);
+    basic_block_set_link(pattern->iter->entry, pattern->cond, 0);
+
+    /* Body block */
     pattern->body = malloc(sizeof(struct control_flow));
-
-    pattern->body->type = CONTROL_FLOW_EMPTY;
-    pattern->body->entry = pattern->iter;
-    pattern->body->pattern.cf_empty = NULL;
-    pattern->body->next = NULL;
-
-    /* Init block */
-    basic_block_resize_links(pattern->init, 1);
-    basic_block_insert_link(pattern->init, pattern->cond, 0);
+    pattern->body->type = CF_EMPTY;
+    pattern->body->entry = pattern->iter->entry;
+    pattern->body->pattern.cf_empty = malloc(sizeof(struct control_flow_empty));
+    pattern->body->next = pattern->iter;
 
     /* Condition block */
     basic_block_resize_links(pattern->cond, 2);
-    basic_block_insert_link(pattern->cond, pattern->body->entry, CF_TRUE_BRANCH_LINK_IDX);
-    basic_block_insert_link(pattern->cond, next_entry, CF_FALSE_BRANCH_LINK_IDX);
+    basic_block_set_link(pattern->cond, pattern->body->entry, CF_TRUE_BRANCH_LINK_IDX);
+    basic_block_set_link(pattern->cond, next_entry, CF_FALSE_BRANCH_LINK_IDX);
 
-    /* Iteration block */
-    basic_block_resize_links(pattern->iter, 1);
-    basic_block_insert_link(pattern->iter, pattern->cond, 0);
+    /* Init block */
+    basic_block_resize_links(pattern->init, 1);
+    basic_block_set_link(pattern->init, pattern->cond, 0);
 
     pattern->body->pattern.cf_empty->ancestor_link =
         &pattern->cond->links.buffer[CF_TRUE_BRANCH_LINK_IDX];

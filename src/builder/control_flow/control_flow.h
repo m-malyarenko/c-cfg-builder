@@ -39,14 +39,14 @@ struct control_flow_while {
 
 struct control_flow_do_while {
     struct control_flow* body;
-    struct basic_block* cond;
+    struct control_flow* cond;
 };
 
 struct control_flow_for {
     struct basic_block* init;
     struct basic_block* cond;
     struct control_flow* body;
-    struct basic_block* iter;
+    struct control_flow* iter;
 };
 
 struct control_flow_switch {

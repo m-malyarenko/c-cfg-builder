@@ -8,6 +8,7 @@
 
 #include "../entity/basic_block.h"
 #include "../utility/basic_block_vector.h"
+#include "../utility/local_jump_map.h"
 #include "control_flow/control_flow.h"
 
 #define VISITOR(name) enum CXChildVisitResult name(CXCursor cursor, CXCursor parent, CXClientData client_data)
@@ -23,21 +24,31 @@ struct cfg_builder_output {
 };
 
 struct cfg_builder_handler {
-    struct control_flow* current_control_flow;
-    struct basic_block* current_basic_block;
+    struct control_flow* current_cf;
+    struct basic_block* current_bb;
+    struct basic_block** current_cf_ancestor_link[2];
+    struct control_flow* current_lj_cf;
     struct basic_block_vector* cfg_nodes;
+    struct local_jump_map* lj_map;
+    struct basic_block* sink_bb;
     enum cfg_builder_status status;
 };
 
+/* Entry point */
+
 struct cfg_builder_output build_function_cfg(CXCursor function_cursor);
+
+/* Visitors */
 
 VISITOR(visit_function);
 
 VISITOR(visit_expression);
 
+VISITOR(visit_declaration);
+
 VISITOR(visit_statement);
 
-VISITOR(visit_declaration);
+VISITOR(visit_compound_statement);
 
 VISITOR(visit_if_statement);
 
@@ -49,9 +60,21 @@ VISITOR(visit_for_statement);
 
 VISITOR(visit_switch_statement);
 
+VISITOR(visit_return_statement);
+
+VISITOR(visit_break_statement);
+
+VISITOR(visit_continue_statement);
+
+VISITOR(visit_goto_statement);
+
 VISITOR(inspect_children);
 
-/* Utility visitors */
+/* Utility */
+
+struct cursor_vector* get_cursor_children(CXCursor cursor);
+
+bool can_put_expression_in_current_bb(const struct cfg_builder_handler* handler);
 
 void push_spelling_to_basic_block(CXCursor cursor, struct basic_block* bb);
 
