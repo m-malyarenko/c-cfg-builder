@@ -18,7 +18,6 @@ struct basic_block {
     struct {
         struct basic_block** buffer;
         size_t len;
-        size_t cap;
     } links;
 };
 

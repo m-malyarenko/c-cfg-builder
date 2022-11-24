@@ -7,7 +7,6 @@
 struct basic_block* basic_block_new() {
     struct basic_block* new_basic_block = malloc(sizeof(struct basic_block));
 
-    new_basic_block->links.cap = 0;
     new_basic_block->links.len = 0;
     new_basic_block->links.buffer = NULL;
 
@@ -64,15 +63,13 @@ void basic_block_resize_links(struct basic_block* self, size_t new_size) {
         return;
     }
 
-    self->links.cap = new_size;
+    self->links.len = new_size;
     self->links.buffer =
-        realloc(self->links.buffer, self->links.cap * sizeof(struct basic_block*));
+        realloc(self->links.buffer, self->links.len * sizeof(struct basic_block*));
     
     for (size_t i = self->links.len ; i < new_size; i++) {
         self->links.buffer[i] = NULL;
     }
-
-    self->links.len = new_size;
 }
 
 void basic_block_set_link(struct basic_block* self, struct basic_block* bb, size_t idx) {
