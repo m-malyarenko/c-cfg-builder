@@ -2,7 +2,7 @@
 # Project properties
 ###############################################################################
 
-PROJECT_NAME = c-cfg-builder
+PROJECT_NAME = c-cfg-lib
 PROJECT_VERSION = 0.1.0
 PROJECT_TYPE = BIN
 
