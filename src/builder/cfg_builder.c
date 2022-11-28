@@ -4,51 +4,52 @@
 
 #include <clang-c/Index.h>
 
-#include "../utility/cursor_vector.h"
-#include "../utility/basic_block_vector.h"
-#include "../utility/local_jump_map.h"
+#include "../utility/cursor_vec.h"
+#include "../utility/basic_block_vec.h"
 #include "../utility/spelling.h"
 #include "../entity/basic_block.h"
 #include "../entity/operation.h"
 #include "cfg_builder.h"
 
-struct cfg_builder_output build_function_cfg(CXCursor function_cursor) {
-    if (clang_Cursor_isNull(function_cursor)
-            || clang_isInvalid(clang_getCursorKind(function_cursor)))
+struct cfg_builder_output build_function_cfg(CXCursor func_cursor) {
+    if (clang_Cursor_isNull(func_cursor)
+            || clang_isInvalid(clang_getCursorKind(func_cursor)))
     {
         return (struct cfg_builder_output) { NULL, NULL };
     }
 
     /* Root control flow with dummy basic block as terminator */
-    struct control_flow* root_control_flow = control_flow_new(CF_EMPTY, NULL);
-    root_control_flow->pattern.cf_empty->ancestor_link = NULL;
-    struct control_flow* sink_control_flow =
-        control_flow_create_successor(root_control_flow, CF_LINEAR);
-
-    struct basic_block* cfg_sink = sink_control_flow->entry;
-    struct basic_block_vector* cfg_nodes = basic_block_vector_new();
+    struct cf_node* func = cf_func_new();
+    struct basic_block* cfg_sink = basic_block_new();
+    struct basic_block_vec* cfg_nodes = basic_block_vec_new();
 
     struct cfg_builder_handler handler = {
-        .current_cf = root_control_flow,
-        .current_bb = NULL,
-        .current_cf_ancestor_link = { NULL, NULL },
-        .current_lj_cf = NULL,
-        .cfg_nodes = cfg_nodes,
-        .lj_map = local_jump_map_new(),
+        .current_cf_node = NULL,
+        .parent_cf_node = func,
+        .return_cf_node = NULL,
+        .break_target = NULL,
+        .continue_target = NULL,
+        .link_bb = cfg_sink,
         .sink_bb = cfg_sink,
+        .cfg_nodes = cfg_nodes,
+        .goto_table = goto_table_new(),
         .status = CFG_BUILDER_OK,
     };
 
     /* Function traversing entry */
-    clang_visitChildren(function_cursor, visit_function, &handler);
+    // clang_visitChildren(func_cursor, visit_subnode, &handler);
+
+    basic_block_vec_push(cfg_nodes, cfg_sink);
+
+    /* CFG post processing */
+    connect_goto_labels(handler.goto_table);
+    goto_table_drop(&handler.goto_table);
 
     if (handler.status != CFG_BUILDER_OK) {
-        // TODO Drop CFG
-        basic_block_vector_drop(&cfg_nodes);
+        cf_node_drop(&func);
+        basic_block_vec_drop(&cfg_nodes);
         return (struct cfg_builder_output) { NULL, NULL };
     }
-
-    basic_block_vector_push(cfg_nodes, cfg_sink);
 
     struct cfg_builder_output output = {
         .cfg_nodes = cfg_nodes,
@@ -58,26 +59,38 @@ struct cfg_builder_output build_function_cfg(CXCursor function_cursor) {
     return output;
 }
 
-VISITOR(visit_function) {
+VISITOR(visit_subnode) {
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
     struct cfg_builder_handler* handler = client_data;
 
-    if (cursor_kind == CXCursor_ParmDecl) {
-        return CXVisit_Continue;
-    }
-
     enum CXChildVisitResult result = CXChildVisit_Continue;
+    
+    /* Before call */
+    struct cf_node* const saved_parent_cf_node = handler->parent_cf_node;
+    struct cf_node* const saved_current_cf_node = handler->current_cf_node;
+
+    handler->parent_cf_node = saved_current_cf_node;
+    handler->current_cf_node = NULL;
+    handler->return_cf_node = NULL;
 
     if (clang_isDeclaration(cursor_kind)) {
-        result = visit_declaration(cursor, parent,handler);
+        handler->current_cf_node = cf_decl_new(handler->parent_cf_node);
+        result = visit_declaration(cursor, parent, handler);
     } else if (clang_isExpression(cursor_kind)) {
+        handler->current_cf_node = cf_expr_new(handler->parent_cf_node);
         result = visit_expression(cursor, parent, handler);
     } else if (clang_isStatement(cursor_kind)) {
         result = visit_statement(cursor, parent, handler);
     } else {
         handler->status = CFG_BUILDER_UNSUPPORTED_SYNTAX;
+        handler->current_cf_node = NULL;
         result =  CXChildVisit_Break;
     }
+
+    /* After call */
+    handler->return_cf_node = handler->current_cf_node;
+    handler->current_cf_node = saved_current_cf_node;
+    handler->parent_cf_node = saved_parent_cf_node;
 
     return result;
 }
@@ -87,23 +100,20 @@ VISITOR(visit_expression) {
     struct cfg_builder_handler* handler = client_data;
 
     assert(clang_isExpression(cursor_kind));
+    assert(handler->current_cf_node->type == CF_NODE_EXPR);
 
-    if (clang_isUnexposed(cursor_kind)) {
-        clang_visitChildren(cursor, visit_expression, handler);
-        return CXChildVisit_Continue;
-    }
+    struct cf_expr* const expr = handler->current_cf_node->node._expr;
 
-    const bool continue_in_basic_block = can_put_expression_in_current_bb(handler);
+    // TODO Traverse expression tree
+    push_spelling_to_basic_block(cursor, expr->bb);
+    basic_block_resize_links(expr->bb, 1);
+    basic_block_set_link(expr->bb, handler->link_bb, 0);
 
-    if (!continue_in_basic_block) {
-        struct control_flow* linear_successor =
-            control_flow_create_successor(handler->current_cf, CF_LINEAR);
-        handler->current_cf = linear_successor;
-        handler->current_bb = handler->current_cf->entry;
-        basic_block_vector_push(handler->cfg_nodes, handler->current_bb);
-    }
+    /* Add basic block to CFG nodes */
+    basic_block_vec_push(handler->cfg_nodes, expr->bb);
 
-    push_spelling_to_basic_block(cursor, handler->current_bb);
+    handler->current_cf_node->entry = expr->bb;
+    handler->link_bb = expr->bb;
 
     return CXChildVisit_Continue;
 }
@@ -113,27 +123,43 @@ VISITOR(visit_declaration) {
     struct cfg_builder_handler* handler = client_data;
 
     assert(clang_isDeclaration(cursor_kind));
+    assert(handler->current_cf_node->type == CF_NODE_DECL);
 
-    enum CXChildVisitResult result = CXChildVisit_Continue;
-
-    if (cursor_kind != CXCursor_VarDecl) {
+    if ((cursor_kind != CXCursor_VarDecl) && (cursor_kind != CXCursor_ParmDecl)) {
         handler->status = CFG_BUILDER_UNSUPPORTED_SYNTAX;
+        handler->current_cf_node = NULL;
         return CXChildVisit_Break;
     }
 
-    const bool continue_in_basic_block = can_put_expression_in_current_bb(handler);
+    struct cf_decl* const decl = handler->current_cf_node->node._decl;
 
-    if (!continue_in_basic_block) {
-        struct control_flow* linear_successor =
-            control_flow_create_successor(handler->current_cf, CF_LINEAR);
-        handler->current_cf = linear_successor;
-        handler->current_bb = handler->current_cf->entry;
-        basic_block_vector_push(handler->cfg_nodes, handler->current_bb);
+    /* Type name */
+    CXType cursor_type = clang_getCursorType(cursor);
+    CXString cursor_type_spelling = clang_getTypeSpelling(cursor_type);
+    str_append(decl->type_name, clang_getCString(cursor_type_spelling));
+    clang_disposeString(cursor_type_spelling);
+
+    /* Initialization */
+    struct cursor_vec* children = get_cursor_children(cursor);
+    assert((children->len == 1) || (children->len == 0));
+    const bool has_initialization = (children->len == 1);
+
+    enum CXChildVisitResult visit_result = CXChildVisit_Continue;
+
+    if (has_initialization) {
+        visit_result = visit_subnode(children->buffer[0], cursor, handler);
+
+        decl->expr = handler->return_cf_node;
+    } else {
+        decl->expr = cf_expr_new(handler->current_cf_node);
     }
 
-    push_spelling_to_basic_block(cursor, handler->current_bb);
+    handler->current_cf_node->entry =
+        has_initialization
+            ? decl->expr->entry
+            : handler->link_bb;
 
-    return result;
+    return visit_result;
 }
 
 VISITOR(visit_statement) {
@@ -142,62 +168,88 @@ VISITOR(visit_statement) {
 
     assert(clang_isStatement(cursor_kind));
 
-    if (cursor_kind == CXCursor_NullStmt) {
-        return CXChildVisit_Continue;
-    }
-
-    if (clang_isUnexposed(cursor_kind)) {
-        const int visit_status =
-            clang_visitChildren(cursor, visit_statement, handler);
-        return (visit_status == 0) ? CXChildVisit_Continue : CXChildVisit_Break;
-    }
-
-    if (cursor_kind == CXCursor_CompoundStmt) {
-        return visit_compound_statement(cursor, parent, handler);
-    }
-
-    enum CXChildVisitResult result = CXChildVisit_Continue;
+    enum CXChildVisitResult visit_result = CXChildVisit_Continue;
 
     switch (cursor_kind) {
+        case CXCursor_UnexposedStmt: {
+            const int visit_child_result =
+                clang_visitChildren(cursor, visit_statement, handler);
+
+            visit_result =
+                (visit_child_result == 0)
+                    ? CXChildVisit_Continue
+                    : CXChildVisit_Break;
+        } break;
         case CXCursor_DeclStmt: {
-            const int visit_status =
-                clang_visitChildren(cursor, visit_declaration, handler);
-            result = (visit_status == 0) ? CXChildVisit_Continue : CXChildVisit_Break;
+            handler->current_cf_node = cf_stmnt_decl_new(handler->parent_cf_node);
+            visit_result = visit_declaration_statement(cursor, parent, handler);
+        } break;
+        case CXCursor_NullStmt: {
+            handler->current_cf_node = cf_node_new(CF_NODE_NULL, NULL, handler->parent_cf_node);
+            handler->current_cf_node->entry = handler->link_bb;
+            visit_result = CXChildVisit_Continue;
+        } break;
+        case CXCursor_CompoundStmt: {
+            handler->current_cf_node = cf_stmnt_compound_new(handler->parent_cf_node);
+            visit_result = visit_compound_statement(cursor, parent, handler);
         } break;
         case CXCursor_IfStmt: {
-            result = visit_if_statement(cursor, parent, handler);
-        } break;
-        case CXCursor_WhileStmt: {
-            result = visit_while_statement(cursor, parent, handler);
-        } break;
-        case CXCursor_DoStmt: {
-            result = visit_do_while_statement(cursor, parent, handler);
-        } break;
-        case CXCursor_ForStmt: {
-            result = visit_for_statement(cursor, parent, handler);
+            handler->current_cf_node = cf_stmnt_if_new(handler->parent_cf_node);
+            visit_result = visit_if_statement(cursor, parent, handler);
         } break;
         case CXCursor_SwitchStmt: {
-            result = visit_switch_statement(cursor, parent, handler);
+            handler->current_cf_node = cf_stmnt_switch_new(handler->parent_cf_node);
+            visit_result = visit_switch_statement(cursor, parent, handler);
         } break;
-        case CXCursor_ReturnStmt: {
-            result = visit_return_statement(cursor, parent, handler);
+        case CXCursor_WhileStmt: {
+            handler->current_cf_node = cf_stmnt_while_new(handler->parent_cf_node);
+            visit_result = visit_while_statement(cursor, parent, handler);
+        } break;
+        case CXCursor_DoStmt: {
+            handler->current_cf_node = cf_stmnt_do_new(handler->parent_cf_node);
+            visit_result = visit_do_statement(cursor, parent, handler);
+        } break;
+        case CXCursor_ForStmt: {
+            handler->current_cf_node = cf_stmnt_for_new(handler->parent_cf_node);
+            visit_result = visit_for_statement(cursor, parent, handler);
         } break;
         case CXCursor_BreakStmt: {
-            result = visit_break_statement(cursor, parent, handler);
+            handler->current_cf_node = cf_stmnt_new(CF_STMNT_BREAK, NULL, handler->parent_cf_node);
+            visit_result = visit_break_statement(cursor, parent, handler);
         } break;
         case CXCursor_ContinueStmt: {
-            result = visit_continue_statement(cursor, parent, handler);
+            handler->current_cf_node = cf_stmnt_new(CF_STMNT_CONTINUE, NULL, handler->parent_cf_node);
+            visit_result = visit_continue_statement(cursor, parent, handler);
+        } break;
+        case CXCursor_ReturnStmt: {
+            handler->current_cf_node = cf_stmnt_return_new(handler->parent_cf_node);
+            visit_result = visit_return_statement(cursor, parent, handler);
         } break;
         case CXCursor_GotoStmt: {
-            result = visit_goto_statement(cursor, parent, handler);
+            handler->current_cf_node = cf_stmnt_goto_new(handler->parent_cf_node);
+            visit_result = visit_goto_statement(cursor, parent, handler);
+        } break;
+        case CXCursor_LabelStmt: {
+            handler->current_cf_node = cf_stmnt_label_new(handler->parent_cf_node);
+            visit_result = visit_label_statement(cursor, parent, handler);
+        } break;
+        case CXCursor_CaseStmt: {
+            handler->current_cf_node = cf_stmnt_case_new(handler->parent_cf_node);
+            visit_result = visit_case_statement(cursor, parent, handler);
+        } break;
+        case CXCursor_DefaultStmt: {
+            handler->current_cf_node = cf_stmnt_default_new(handler->parent_cf_node);
+            visit_result = visit_default_statement(cursor, parent, handler);
         } break;
         default: {
+            handler->current_cf_node = NULL;
+            handler->return_cf_node = NULL;
             handler->status = CFG_BUILDER_UNSUPPORTED_SYNTAX;
-            result = CXChildVisit_Break;
-        }
+            visit_result = CXChildVisit_Break;
+        } break;
     }
 
-    return result;
+    return visit_result;
 }
 
 VISITOR(visit_compound_statement) {
@@ -205,34 +257,77 @@ VISITOR(visit_compound_statement) {
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_CompoundStmt);
+    assert(handler->current_cf_node->type == CF_NODE_STMNT);
+    assert(handler->current_cf_node->node._stmnt->type == CF_STMNT_COMPOUND);
 
-    struct cursor_vector* children = get_cursor_children(cursor);
+    struct cursor_vec* children = get_cursor_children(cursor);
+    const size_t children_num = children->len;
 
-    /* Manualy visit all children */
-    enum CXChildVisitResult result = CXChildVisit_Continue;
-    for (size_t i = 0; i < children->len; i++) {
-        CXCursor child_cursor = children->buffer[i];
-        const enum CXCursorKind child_cursor_kind = clang_getCursorKind(child_cursor);
+    struct cf_stmnt_compound* const stmnt_compound =
+        handler->current_cf_node->node._stmnt->_compound;
 
-        if (clang_isDeclaration(child_cursor_kind)) {
-            result = visit_declaration(child_cursor, cursor,handler);
-        } else if (clang_isExpression(child_cursor_kind)) {
-            result = visit_expression(child_cursor, cursor, handler);
-        } else if (clang_isStatement(child_cursor_kind)) {
-            result = visit_statement(child_cursor, cursor, handler);
-        } else {
-            handler->status = CFG_BUILDER_UNSUPPORTED_SYNTAX;
-            result = CXChildVisit_Break;
-        }
+    enum CXChildVisitResult visit_result = CXChildVisit_Continue;
 
-        if (result == CXChildVisit_Break) {
+    for (size_t i = 0; i < children_num; i++) {
+        CXCursor child = children->buffer[(children_num - i) - 1];
+
+        visit_result = visit_subnode(child, cursor, handler);
+
+        if (visit_result == CXChildVisit_Break) {
             break;
         }
+
+        cf_node_vec_push(stmnt_compound->items, handler->return_cf_node);
     }
 
-    cursor_vector_drop(&children);
+    if (visit_result != CXChildVisit_Break) {
+        handler->current_cf_node->entry =
+            (children_num != 0)
+                ? stmnt_compound->items->buffer[children_num - 1]->entry
+                : handler->link_bb;
+    } else {
+        handler->current_cf_node = NULL;
+    }
 
-    return result;
+    cursor_vec_drop(&children);
+
+    return visit_result;
+}
+
+VISITOR(visit_declaration_statement) {
+    const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    struct cfg_builder_handler* handler = client_data;
+
+    assert(cursor_kind == CXCursor_DeclStmt);
+
+    struct cursor_vec* children = get_cursor_children(cursor);
+    const size_t children_num = children->len;
+
+    struct cf_stmnt_decl* const stmnt_decl =
+        handler->current_cf_node->node._stmnt->_decl;
+
+    enum CXChildVisitResult visit_result = CXChildVisit_Continue;
+
+    for (size_t i = 0; i < children_num; i++) {
+        CXCursor child = children->buffer[(children_num - i) - 1];
+
+        visit_result = visit_subnode(child, cursor, handler);
+
+        if (visit_result == CXChildVisit_Break) {
+            break;
+        }
+
+        cf_node_vec_push(stmnt_decl->items, handler->return_cf_node);
+    }
+
+    handler->current_cf_node->entry =
+        (children_num != 0)
+            ? stmnt_decl->items->buffer[children_num - 1]->entry
+            : handler->link_bb;
+    
+    cursor_vec_drop(&children);
+
+    return visit_result;
 }
 
 VISITOR(visit_if_statement) {
@@ -240,61 +335,100 @@ VISITOR(visit_if_statement) {
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_IfStmt);
+    assert(handler->current_cf_node->type == CF_NODE_STMNT);
+    assert(handler->current_cf_node->node._stmnt->type == CF_STMNT_IF);
 
-    struct cursor_vector* children = get_cursor_children(cursor);
-    assert((children->len == 2) || (children->len == 3));
+    struct cursor_vec* children = get_cursor_children(cursor);
+    const size_t children_num = children->len;
+    assert((children_num == 2) || (children_num == 3));
+    const bool has_else_branch = (children_num == 3);
 
-    const bool has_else_branch = (children->len == 3);
-    const enum control_flow_type cf_type = has_else_branch ? CF_IF_ELSE : CF_IF;
+    struct basic_block* const saved_link_bb = handler->link_bb;
+    struct cf_stmnt_if* const stmnt_if = handler->current_cf_node->node._stmnt->_if;
 
-    struct control_flow* const if_successor =
-        control_flow_create_successor(handler->current_cf, cf_type);
+    enum CXChildVisitResult visit_result = CXChildVisit_Continue;
 
-    handler->current_cf = if_successor;
-    handler->current_bb = if_successor->entry;
-    basic_block_vector_push(handler->cfg_nodes, handler->current_bb);
+    if (has_else_branch) {
+        /* False branch */
+        visit_result = visit_subnode(children->buffer[2], cursor, handler);
 
-    /* Condition */
-    CXCursor condition_cursor = children->buffer[0];
-    assert(clang_isExpression(clang_getCursorKind(condition_cursor)));
-    visit_expression(condition_cursor, cursor, handler);
-
-    /* Body */
-    enum CXChildVisitResult result = CXChildVisit_Continue;
-
-    for (size_t i = 1; i < children->len; i++) {
-        CXCursor body_cursor = children->buffer[i];
-        const enum CXCursorKind body_cursor_kind = clang_getCursorKind(body_cursor);
-
-        if (has_else_branch) {               
-            handler->current_cf =
-                (i == 1)
-                    ? if_successor->pattern.cf_if_else->body_true
-                    : if_successor->pattern.cf_if_else->body_false;
-        } else {
-            handler->current_cf = if_successor->pattern.cf_if->body;
+        if (visit_result == CXChildVisit_Break) {
+            cursor_vec_drop(&children);
+            return visit_result;
         }
-        
-        handler->current_bb = NULL; // Current control flow is empty
 
-        if (clang_isExpression(body_cursor_kind)) {
-            result = visit_expression(body_cursor, cursor, handler);
-        } else if (clang_isStatement(body_cursor_kind)) {
-            result = visit_statement(body_cursor, cursor, handler);
-        } else {
-            handler->status = CFG_BUILDER_UNSUPPORTED_SYNTAX;
-            result = CXChildVisit_Break;
-            break;
-        }
+        stmnt_if->body_false = handler->return_cf_node;
+        handler->link_bb = saved_link_bb;
+    } else {
+        stmnt_if->body_false = NULL;
     }
 
-    /* Restore context */
-    handler->current_cf = if_successor;
-    handler->current_bb = NULL; // Control flow is over
+    /* True branch */
+    visit_result = visit_subnode(children->buffer[1], cursor, handler);
 
-    cursor_vector_drop(&children);
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
+    }
 
-    return result;
+    stmnt_if->body_true = handler->return_cf_node;
+
+    /* Condition */
+    visit_result = visit_subnode(children->buffer[0], cursor, handler);
+
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
+    }
+
+    stmnt_if->cond = handler->return_cf_node;
+
+    connect_condition_branches(
+        stmnt_if->cond,
+        stmnt_if->body_true->entry,
+        has_else_branch
+            ? stmnt_if->body_false->entry
+            : saved_link_bb
+    );
+
+    handler->current_cf_node->entry = stmnt_if->cond->entry;
+    handler->link_bb = stmnt_if->cond->entry;
+
+    cursor_vec_drop(&children);
+
+    return visit_result;
+}
+
+VISITOR(visit_switch_statement) {
+    const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    struct cfg_builder_handler* handler = client_data;
+
+    assert(cursor_kind == CXCursor_SwitchStmt);
+
+    struct cursor_vec* children = get_cursor_children(cursor);
+    assert((children->len == 1) || (children->len == 2));
+    const bool has_body = (children->len == 2);
+
+    struct cf_stmnt_case* const cf_stmnt_switch =
+        handler->current_cf_node->node._stmnt->_switch;
+
+    enum CXChildVisitResult visit_result = CXChildVisit_Continue;
+
+    struct basic_block* const saved_link_bb = handler->link_bb;
+
+    /* Const expression */
+    visit_result = visit_subnode(children->buffer[0], cursor, handler);
+
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
+    }
+
+    cf_stmnt_switch->const_expr = handler->return_cf_node;
+
+    cursor_vec_drop(&children);
+    
+    return CXChildVisit_Continue;
 }
 
 VISITOR(visit_while_statement) {
@@ -303,109 +437,116 @@ VISITOR(visit_while_statement) {
 
     assert(cursor_kind == CXCursor_WhileStmt);
 
-    struct cursor_vector* children = get_cursor_children(cursor);
-    assert(children->len == 2); // Condition, Body
+    struct cursor_vec* children = get_cursor_children(cursor);
+    assert(children->len == 2);
 
-    /* Save context */
-    struct control_flow* const saved_lj_cf = handler->current_lj_cf;
+    struct basic_block* const saved_link_bb = handler->link_bb;
+    struct basic_block* const saved_break_target = handler->break_target;
+    struct basic_block* const saved_continue_target = handler->continue_target;
 
-    struct control_flow* const while_successor =
-        control_flow_create_successor(handler->current_cf, CF_WHILE);
+    struct cf_stmnt_while* const stmnt_while =
+        handler->current_cf_node->node._stmnt->_while;
 
-    handler->current_cf = while_successor;
-    handler->current_bb = while_successor->pattern.cf_while->cond;
-    handler->current_lj_cf = while_successor;
-    basic_block_vector_push(handler->cfg_nodes, handler->current_bb);
+    enum CXChildVisitResult visit_result = CXChildVisit_Continue;
 
     /* Condition */
-    CXCursor condition_cursor = children->buffer[0];
-    assert(clang_isExpression(clang_getCursorKind(condition_cursor)));
-    visit_expression(condition_cursor, cursor, handler);
+    visit_result = visit_subnode(children->buffer[0], cursor, handler);
 
-    /* Body */
-    CXCursor body_cursor = children->buffer[1];
-    const enum CXCursorKind body_cursor_kind = clang_getCursorKind(body_cursor);
-    enum CXChildVisitResult result = CXChildVisit_Continue;
-
-    handler->current_cf = while_successor->pattern.cf_while->body;
-    handler->current_bb = NULL; // Current control flow is empty
-
-    if (clang_isExpression(body_cursor_kind)) {
-        result = visit_expression(body_cursor, cursor, handler);
-    } else if (clang_isStatement(body_cursor_kind)) {
-        result = visit_statement(body_cursor, cursor, handler);
-    } else {
-        handler->status = CFG_BUILDER_UNSUPPORTED_SYNTAX;
-        result = CXChildVisit_Break;
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
     }
 
-    /* Restore context */
-    handler->current_lj_cf = saved_lj_cf;
-    handler->current_cf = while_successor;
-    handler->current_bb = NULL; // Control flow is over
+    stmnt_while->cond = handler->return_cf_node;
+    handler->link_bb = stmnt_while->cond->entry;
 
-    cursor_vector_drop(&children);
+    /* Set loop jump targets */
+    handler->continue_target = stmnt_while->cond->entry;
 
-    return result;
+    /* Body branch */
+    handler->break_target = saved_link_bb;
+    visit_result = visit_subnode(children->buffer[1], cursor, handler);
+
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
+    }
+
+    stmnt_while->body = handler->return_cf_node;
+
+    connect_condition_branches(
+        stmnt_while->cond,
+        stmnt_while->body->entry,
+        saved_link_bb
+    );
+
+    handler->current_cf_node->entry = stmnt_while->cond->entry;
+    handler->link_bb = stmnt_while->cond->entry;
+    handler->break_target = saved_break_target;
+    handler->continue_target = saved_continue_target;
+
+    cursor_vec_drop(&children);
+
+    return visit_result;
 }
 
-VISITOR(visit_do_while_statement) {
+VISITOR(visit_do_statement) {
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_DoStmt);
 
-    struct cursor_vector* children = get_cursor_children(cursor);
-    assert(children->len == 2); // Body, Condition
+    struct cursor_vec* children = get_cursor_children(cursor);
+    assert(children->len == 2);
 
-    /* Save context */
-    struct control_flow* const saved_lj_cf = handler->current_lj_cf;
+    struct basic_block* const saved_link_bb = handler->link_bb;
+    struct basic_block* const saved_break_target = handler->break_target;
+    struct basic_block* const saved_continue_target = handler->continue_target;
 
-    struct control_flow* const do_successor =
-        control_flow_create_successor(handler->current_cf, CF_DO_WHILE);
+    struct cf_stmnt_do* const stmnt_do =
+        handler->current_cf_node->node._stmnt->_do;
 
-    handler->current_cf = do_successor;
-    handler->current_bb = NULL;
-    handler->current_lj_cf = do_successor;
-
-    /* Body */
-    CXCursor body_cursor = children->buffer[0];
-    const enum CXCursorKind body_cursor_kind = clang_getCursorKind(body_cursor);
-    enum CXChildVisitResult result = CXChildVisit_Continue;
-
-    handler->current_cf = do_successor->pattern.cf_do_while->body;
-    handler->current_bb = do_successor->pattern.cf_do_while->body->entry;
-    basic_block_vector_push(handler->cfg_nodes, handler->current_bb);
-
-    if (clang_isExpression(body_cursor_kind)) {
-        result = visit_expression(body_cursor, cursor, handler);
-    } else if (clang_isStatement(body_cursor_kind)) {
-        result = visit_statement(body_cursor, cursor, handler);
-    } else {
-        handler->status = CFG_BUILDER_UNSUPPORTED_SYNTAX;
-        handler->current_lj_cf = saved_lj_cf;
-        handler->current_cf = do_successor;
-        cursor_vector_drop(&children);
-        return CXChildVisit_Break;
-    }
+    enum CXChildVisitResult visit_result = CXChildVisit_Continue;
 
     /* Condition */
-    CXCursor condition_cursor = children->buffer[1];
-    assert(clang_isExpression(clang_getCursorKind(condition_cursor)));
+    visit_result = visit_subnode(children->buffer[1], cursor, handler);
 
-    handler->current_cf = do_successor->pattern.cf_do_while->cond;
-    handler->current_bb = do_successor->pattern.cf_do_while->cond->entry;
-    basic_block_vector_push(handler->cfg_nodes, handler->current_bb);
-    visit_expression(condition_cursor, cursor, handler);
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
+    }
 
-    /* Restore context */
-    handler->current_lj_cf = saved_lj_cf;
-    handler->current_cf = do_successor;
-    handler->current_bb = NULL; // Control flow is over
+    stmnt_do->cond = handler->return_cf_node;
 
-    cursor_vector_drop(&children);
+    /* Set loop jump targets */
+    handler->break_target = saved_link_bb;
+    handler->continue_target = stmnt_do->cond->entry;
 
-    return result;
+    /* Body branch */
+    handler->link_bb = stmnt_do->cond->entry;
+    visit_result = visit_subnode(children->buffer[0], cursor, handler);
+
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
+    }
+
+    stmnt_do->body = handler->return_cf_node;
+
+    connect_condition_branches(
+        stmnt_do->cond,
+        stmnt_do->body->entry,
+        saved_link_bb
+    );
+
+    handler->current_cf_node->entry = stmnt_do->body->entry;
+    handler->link_bb = stmnt_do->body->entry;
+    handler->break_target = saved_break_target;
+    handler->continue_target = saved_continue_target;
+
+    cursor_vec_drop(&children);
+
+    return visit_result;
 }
 
 VISITOR(visit_for_statement) {
@@ -414,84 +555,110 @@ VISITOR(visit_for_statement) {
 
     assert(cursor_kind == CXCursor_ForStmt);
 
-    struct cursor_vector* children = get_cursor_children(cursor);
+    struct cursor_vec* children = get_cursor_children(cursor);
+    const size_t children_num = children->len;
+    assert(children_num <= 4);
 
-    if (children->len != 4) {
+    if (children_num != 4) {
         handler->status = CFG_BUILDER_UNSUPPORTED_SYNTAX;
-        cursor_vector_drop(&children);
+        handler->current_cf_node = NULL;
         return CXChildVisit_Break;
     }
 
-    /* Save context */
-    struct control_flow* const saved_lj_cf = handler->current_lj_cf;
+    struct basic_block* const saved_link_bb = handler->link_bb;
+    struct basic_block* const saved_break_target = handler->break_target;
+    struct basic_block* const saved_continue_target = handler->continue_target;
 
-    struct control_flow* const for_successor =
-        control_flow_create_successor(handler->current_cf, CF_FOR);
+    struct cf_stmnt_for* const stmnt_for =
+        handler->current_cf_node->node._stmnt->_for;
 
-    handler->current_cf = for_successor;
-    handler->current_lj_cf = for_successor;
+    enum CXChildVisitResult visit_result = CXChildVisit_Continue;
 
-    /* Init */
-    CXCursor init_cursor = children->buffer[0];
-    const enum CXCursorKind init_cursor_kind = clang_getCursorKind(init_cursor); 
-    assert(clang_isExpression(init_cursor_kind) || (init_cursor_kind == CXCursor_DeclStmt));
-
-    handler->current_bb = handler->current_cf->pattern.cf_for->init;
-    basic_block_vector_push(handler->cfg_nodes, handler->current_bb);
-
-    if (clang_isExpression(init_cursor_kind)) {
-        visit_expression(init_cursor, cursor, handler);
-    } else {
-        clang_visitChildren(init_cursor, visit_declaration, handler);
-    }
-    
     /* Condition */
-    CXCursor cond_cursor = children->buffer[1];
-    assert(clang_isExpression(clang_getCursorKind(cond_cursor)));
+    handler->link_bb = NULL;
+    visit_result = visit_subnode(children->buffer[1], cursor, handler);
 
-    handler->current_bb = handler->current_cf->pattern.cf_for->cond;
-    basic_block_vector_push(handler->cfg_nodes, handler->current_bb);
-    visit_expression(cond_cursor, cursor, handler);
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
+    }
 
-    /* Iter */
-    CXCursor iter_cursor = children->buffer[2];
-    assert(clang_isExpression(clang_getCursorKind(iter_cursor)));
+    stmnt_for->cond = handler->return_cf_node;
 
-    handler->current_cf = handler->current_cf->pattern.cf_for->iter;
-    handler->current_bb = handler->current_cf->pattern.cf_linear->body;
-    basic_block_vector_push(handler->cfg_nodes, handler->current_bb);
-    visit_expression(iter_cursor, cursor, handler);
+    /* Initialization */
+    handler->link_bb = stmnt_for->cond->entry;
+    visit_result = visit_subnode(children->buffer[0], cursor, handler);
+
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
+    }
+
+    stmnt_for->init = handler->return_cf_node;
+
+    /* Iteration */
+    handler->link_bb = stmnt_for->cond->entry;
+    visit_result = visit_subnode(children->buffer[2], cursor, handler);
+
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
+    }
+
+    stmnt_for->iter = handler->return_cf_node;
+
+    /* Set loop jump targets */
+    handler->break_target = saved_link_bb;
+    handler->continue_target = stmnt_for->iter->entry;
 
     /* Body */
-    CXCursor body_cursor = children->buffer[3];
-    const enum CXCursorKind body_cursor_kind = clang_getCursorKind(body_cursor);
+    handler->link_bb = stmnt_for->iter->entry;
+    visit_result = visit_subnode(children->buffer[3], cursor, handler);
 
-    handler->current_cf = for_successor->pattern.cf_for->body;
-    handler->current_bb = NULL; // Current control flow is empty
-
-    enum CXChildVisitResult result = CXChildVisit_Continue;
-
-    if (clang_isExpression(body_cursor_kind)) {
-        result = visit_expression(body_cursor, cursor, handler);
-    } else if (clang_isStatement(body_cursor_kind)) {
-        result = visit_statement(body_cursor, cursor, handler);
-    } else {
-        handler->status = CFG_BUILDER_UNSUPPORTED_SYNTAX;
-        result = CXChildVisit_Break;
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
     }
 
-    /* Restore context */
-    handler->current_lj_cf = saved_lj_cf;
-    handler->current_cf = for_successor;
-    handler->current_bb = NULL; // Control flow is over
+    stmnt_for->body = handler->return_cf_node;
 
-    cursor_vector_drop(&children);
+    connect_condition_branches(
+        stmnt_for->cond,
+        stmnt_for->body->entry,
+        saved_link_bb
+    );
 
-    return result;
+    handler->current_cf_node->entry = stmnt_for->init->entry;
+    handler->link_bb = stmnt_for->init->entry;
+    handler->break_target = saved_break_target;
+    handler->continue_target = saved_continue_target;
+
+    cursor_vec_drop(&children);
+
+    return visit_result;
 }
 
-VISITOR(visit_switch_statement) {
-    // TODO Implement function
+VISITOR(visit_break_statement) {
+    const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    struct cfg_builder_handler* handler = client_data;
+
+    assert(cursor_kind == CXCursor_BreakStmt);
+
+    handler->link_bb = handler->break_target;
+    handler->current_cf_node->entry = handler->break_target;
+
+    return CXChildVisit_Continue;
+}
+
+VISITOR(visit_continue_statement) {
+    const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    struct cfg_builder_handler* handler = client_data;
+
+    assert(cursor_kind == CXCursor_ContinueStmt);
+
+    handler->current_cf_node->entry = handler->continue_target;
+    handler->link_bb = handler->continue_target;
+
     return CXChildVisit_Continue;
 }
 
@@ -501,103 +668,249 @@ VISITOR(visit_return_statement) {
 
     assert(cursor_kind == CXCursor_ReturnStmt);
 
-    struct cursor_vector* children = get_cursor_children(cursor);
+    struct cursor_vec* children = get_cursor_children(cursor);
+    const size_t children_num = children->len;
+    assert((children_num == 0) || (children_num == 1));
+    const bool has_expression = (children_num == 1);
 
-    if (children->len > 0) {
-        CXCursor cond_cursor = children->buffer[0];
-        struct control_flow* const saved_cf = handler->current_cf;
-        assert(clang_isExpression(clang_getCursorKind(cond_cursor)));
+    struct cf_stmnt_return* const stmnt_return =
+        handler->current_cf_node->node._stmnt->_return;
 
-        visit_expression(cond_cursor, cursor, handler);
-        basic_block_set_link(handler->current_cf->entry, handler->sink_bb, 0);
+    enum CXChildVisitResult visit_result = CXChildVisit_Continue;
+
+    if (has_expression) {
+        visit_result = visit_subnode(children->buffer[0], cursor, handler);
+
+        if (visit_result == CXChildVisit_Break) {
+            cursor_vec_drop(&children);
+            return visit_result;
+        }
+
+        stmnt_return->return_expr = handler->return_cf_node;
+        connect_tail(stmnt_return->return_expr, handler->sink_bb);
+        handler->current_cf_node->entry = stmnt_return->return_expr->entry;
     } else {
-        control_flow_connect_tail_recursive(handler->current_cf, handler->sink_bb);
+        stmnt_return->return_expr = NULL;
+        handler->current_cf_node->entry = handler->sink_bb;
+        handler->link_bb = handler->sink_bb;
     }
 
-    return CXChildVisit_Continue;
+    cursor_vec_drop(&children);
+
+    return visit_result;
 }
 
-VISITOR(visit_break_statement) {
+VISITOR(visit_case_statement) {
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
     struct cfg_builder_handler* handler = client_data;
 
-    assert(cursor_kind == CXCursor_BreakStmt);
-
-    control_flow_connect_tail_recursive(handler->current_cf, handler->current_lj_cf->next->entry);
-
-    struct control_flow* stub_successor =
-        control_flow_create_successor(handler->current_cf, CF_EMPTY);
-
-    handler->current_cf = stub_successor;
-    handler->current_bb = NULL;
+    assert(cursor_kind == CXCursor_CaseStmt);
 
     return CXChildVisit_Continue;
 }
 
-VISITOR(visit_continue_statement) {
-    // TODO Implement function
-    return CXChildVisit_Continue;
+VISITOR(visit_default_statement) {
+    const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    struct cfg_builder_handler* handler = client_data;
+
+    assert(cursor_kind == CXCursor_DefaultStmt);
+    struct cursor_vec* children = get_cursor_children(cursor);
+    assert((children->len == 0) || (children->len == 1));
+    const bool has_body = (children->len == 1);
+
+    struct basic_block* const saved_link_bb = handler->link_bb;
+
+    struct cf_stmnt_case* const stmnt_default =
+        handler->current_cf_node->node._stmnt->_default;
+
+    enum CXChildVisitResult visit_result = CXChildVisit_Continue;
+
+    if (has_body) {
+        /* Body */
+        handler->link_bb = handler->break_target; // ?
+        visit_result = visit_subnode(children->buffer[0], cursor, handler);
+
+        if (visit_result == CXChildVisit_Break) {
+            cursor_vec_drop(&children);
+            return visit_result;
+        }
+
+        stmnt_default->body = handler->return_cf_node;
+    } else {
+        stmnt_default->body = NULL;
+    }
+
+    // TODO Сделать default ветку по мотивам goto: приделать её после последнего case выражения.
+
+    /* Const expression */
+    visit_result = visit_subnode(children->buffer[0], cursor, handler);
+
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
+    }
+
+    stmnt_default->const_expr = handler->return_cf_node;
+    handler->current_cf_node->entry = stmnt_default->const_expr->entry;
+
+    cursor_vec_drop(&children);
 }
 
 VISITOR(visit_goto_statement) {
-    // TODO Implement function
+    const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    struct cfg_builder_handler* handler = client_data;
+
+    assert(cursor_kind == CXCursor_GotoStmt);
+
+    struct cf_stmnt_goto* const stmnt_goto =
+        handler->current_cf_node->node._stmnt->_goto;
+
+    /* Get destination label */
+    struct cursor_vec* children = get_cursor_children(cursor);
+    assert(children->len == 1);
+
+    /* Save label */
+    CXString label = clang_getCursorDisplayName(children->buffer[0]);
+    str_append(stmnt_goto->label, clang_getCString(label));
+    clang_disposeString(label);
+
+    /* Connect imaginary basic block to link */
+    push_spelling_to_basic_block(cursor, stmnt_goto->imag_bb);
+    basic_block_resize_links(stmnt_goto->imag_bb, 1);
+    basic_block_set_link(stmnt_goto->imag_bb, handler->link_bb, 0);
+
+    /* Add imaginary basic block to CFG nodes */
+    basic_block_vec_push(handler->cfg_nodes, stmnt_goto->imag_bb);
+
+    /* Add source entry to goto table */
+    goto_table_push(handler->goto_table, handler->current_cf_node, GOTO_ENTRY_SRC);
+
+    handler->current_cf_node->entry = stmnt_goto->imag_bb;
+    handler->link_bb = stmnt_goto->imag_bb;
+
+    cursor_vec_drop(&children);
+
+    return CXChildVisit_Continue;
+}
+
+VISITOR(visit_label_statement) {
+    const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    struct cfg_builder_handler* handler = client_data;
+
+    assert(cursor_kind == CXCursor_LabelStmt);
+
+    struct cf_stmnt_label* const stmnt_label =
+        handler->current_cf_node->node._stmnt->_label;
+
+    /* Save label */
+    CXString label = clang_getCursorDisplayName(cursor);
+    str_append(stmnt_label->label, clang_getCString(label));
+    clang_disposeString(label);
+
+    /* Get label statement body */
+    struct cursor_vec* children = get_cursor_children(cursor);
+    assert((children->len == 1) || (children->len == 0));
+    const bool has_body = (children->len == 1);
+
+    if (has_body) {
+        const enum CXChildVisitResult visit_result =
+            visit_subnode(children->buffer[0], cursor, handler);
+
+        if (visit_result == CXChildVisit_Break) {
+            cursor_vec_drop(&children);
+            return visit_result;
+        }
+    }
+
+    /* Add destination entry to goto table */
+    goto_table_push(handler->goto_table, handler->current_cf_node, GOTO_ENTRY_DEST);
+
+    handler->current_cf_node->entry =
+        has_body
+            ? handler->return_cf_node->entry
+            : handler->link_bb;
+
+    cursor_vec_drop(&children);
+
     return CXChildVisit_Continue;
 }
 
 VISITOR(inspect_children) {
-    struct cursor_vector* children = client_data;
-    cursor_vector_push(children, cursor);
+    struct cursor_vec* children = client_data;
+    cursor_vec_push(children, cursor);
 
     return CXChildVisit_Continue;
 }
 
-struct cursor_vector* get_cursor_children(CXCursor cursor) {
-    struct cursor_vector* children = cursor_vector_new();
+struct cursor_vec* normalize_switch_body(CXCursor cursor) {
+    const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+
+    assert(cursor_kind == CXCursor_SwitchStmt);
+
+
+}
+
+void connect_goto_labels(struct goto_table* table) {
+    if (table == NULL) {
+        return;
+    }
+
+    const size_t src_num = table->src->len;
+    const size_t dest_num = table->dest->len;
+
+    for (size_t i = 0; i < src_num; i++) {
+        struct cf_node* src_entry = table->src->buffer[i];
+        struct basic_block* const imag_bb = src_entry->node._stmnt->_goto->imag_bb;
+        assert(imag_bb->links.len == 1);
+        const str_t* src_label = src_entry->node._stmnt->_goto->label;
+
+        for (size_t j = 0; j < dest_num; j++) {
+            const struct cf_node* dest_entry = table->dest->buffer[j];
+            const str_t* dest_label = dest_entry->node._stmnt->_label->label;
+
+            if (str_eq(src_label, dest_label)) {
+                basic_block_set_link(imag_bb, dest_entry->entry, 0);
+            }
+        }
+    }
+}
+
+struct cursor_vec* get_cursor_children(CXCursor cursor) {
+    struct cursor_vec* children = cursor_vec_new();
     clang_visitChildren(cursor, inspect_children, children);
 
     return children;
 }
 
-bool can_put_expression_in_current_bb(const struct cfg_builder_handler* handler) {
-    assert(handler != NULL);
+void connect_tail(struct cf_node* node, struct basic_block* target) {
+    assert(node != NULL);
+    assert(target != NULL);
 
-    const enum control_flow_type cf_type = handler->current_cf->type;
-    const struct control_flow* const current_cf = handler->current_cf;
-    const struct basic_block* const current_bb = handler->current_bb;
+    // TODO Support all types of nodes
+    assert((node->type == CF_NODE_EXPR) || (node->type = CF_NODE_DECL));
 
-    bool continue_in_basic_block = false;
+    struct cf_expr* expr =
+        (node->type == CF_NODE_DECL)
+            ? node->node._decl->expr->node._expr
+            : node->node._expr;
 
-    switch (cf_type) {
-        case CF_LINEAR: {
-            continue_in_basic_block = true;
-        } break;
-        case CF_IF: {
-            continue_in_basic_block = (current_bb == current_cf->pattern.cf_if->cond);
-        } break;
-        case CF_IF_ELSE: {
-            continue_in_basic_block = (current_bb == current_cf->pattern.cf_if_else->cond);
-        } break;
-        case CF_WHILE: {
-            continue_in_basic_block = (current_bb == current_cf->pattern.cf_while->cond);
-        } break;
-        case CF_DO_WHILE: {
-            continue_in_basic_block = (current_bb == current_cf->pattern.cf_do_while->cond->entry);
-        } break;
-        case CF_FOR: {
-            continue_in_basic_block =
-                (current_bb == current_cf->pattern.cf_for->init)
-                    || (current_bb == current_cf->pattern.cf_for->cond)
-                    || (current_bb == current_cf->pattern.cf_for->iter->entry);
-        } break;
-        case CF_SWITCH: {
-            continue_in_basic_block = (current_bb == current_cf->pattern.cf_switch->cond);
-        } break;
-        default: {
-            continue_in_basic_block = false;
-        } break;
-    }
+    basic_block_resize_links(expr->bb, 1);
+    basic_block_set_link(expr->bb, target, 0); 
+}
 
-    return continue_in_basic_block;
+void connect_condition_branches(struct cf_node* cond,
+                                struct basic_block* true_entry,
+                                struct basic_block* false_entry)
+{
+    assert(cond != NULL);
+    assert(true_entry != NULL);
+    assert(false_entry != NULL);
+    assert(cond->type == CF_NODE_EXPR);
+
+    struct cf_expr* const cond_expr = cond->node._expr;
+    basic_block_resize_links(cond_expr->bb, 2); 
+    basic_block_set_link(cond_expr->bb, true_entry, 0);
+    basic_block_set_link(cond_expr->bb, false_entry, 1);
 }
 
 void push_spelling_to_basic_block(CXCursor cursor, struct basic_block* bb) {
