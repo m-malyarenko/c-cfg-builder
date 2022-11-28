@@ -2,21 +2,20 @@
 
 #include <clang-c/Index.h>
 
-#include "cursor_vector.h"
+#include "cursor_vec.h"
 
-struct cursor_vector* cursor_vector_new() {
-    struct cursor_vector* new_children_vector =
-        malloc(sizeof(struct cursor_vector));
+struct cursor_vec* cursor_vec_new() {
+    struct cursor_vec* new_cursor_vec = malloc(sizeof(struct cursor_vec));
 
-    new_children_vector->cap = UTILITY_CHILDREN_VECTOR_DEFAULT_CAP;
-    new_children_vector->buffer =
-        malloc(new_children_vector->cap * sizeof(CXCursor));
-    new_children_vector->len = 0;
+    new_cursor_vec->cap = UTILITY_CURSOR_VEC_DEFAULT_CAP;
+    new_cursor_vec->buffer =
+        malloc(new_cursor_vec->cap * sizeof(CXCursor));
+    new_cursor_vec->len = 0;
 
-    return new_children_vector;
+    return new_cursor_vec;
 }
 
-void cursor_vector_drop(struct cursor_vector** self) {
+void cursor_vec_drop(struct cursor_vec** self) {
     if ((self == NULL) || (*self == NULL)) {
         return;
     }
@@ -29,7 +28,7 @@ void cursor_vector_drop(struct cursor_vector** self) {
     *self = NULL;
 }
 
-void cursor_vector_push(struct cursor_vector* self, CXCursor child) {
+void cursor_vec_push(struct cursor_vec* self, CXCursor child) {
     if (self == NULL) {
         return;
     }
@@ -43,7 +42,7 @@ void cursor_vector_push(struct cursor_vector* self, CXCursor child) {
     self->len += 1;
 }
 
-CXCursor cursor_vector_pop(struct cursor_vector* self) {
+CXCursor cursor_vec_pop(struct cursor_vec* self) {
     if ((self == NULL) || (self->len == 0)) {
         return clang_getNullCursor();
     }

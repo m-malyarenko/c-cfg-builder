@@ -1,12 +1,12 @@
 #include <stdlib.h>
 
-#include "basic_block_vector.h"
+#include "basic_block_vec.h"
 
-struct basic_block_vector* basic_block_vector_new() {
-    struct basic_block_vector* new_basic_block_vector =
-        malloc(sizeof(struct basic_block_vector));
+struct basic_block_vec* basic_block_vec_new() {
+    struct basic_block_vec* new_basic_block_vector =
+        malloc(sizeof(struct basic_block_vec));
 
-    new_basic_block_vector->cap = UTILITY_BASIC_BLOCK_VECTOR_DEVAULT_CAP;
+    new_basic_block_vector->cap = UTILITY_BASIC_BLOCK_VEC_DEFAULT_CAP;
     new_basic_block_vector->buffer =
         malloc(new_basic_block_vector->cap * sizeof(struct basic_block*));
     new_basic_block_vector->len = 0;
@@ -14,7 +14,7 @@ struct basic_block_vector* basic_block_vector_new() {
     return new_basic_block_vector;
 }
 
-void basic_block_vector_drop(struct basic_block_vector** self) {
+void basic_block_vec_drop(struct basic_block_vec** self) {
     if ((self == NULL) || (*self == NULL)) {
         return;
     }
@@ -27,7 +27,7 @@ void basic_block_vector_drop(struct basic_block_vector** self) {
     *self = NULL;
 }
 
-void basic_block_vector_push(struct basic_block_vector* self, struct basic_block* basic_block) {
+void basic_block_vec_push(struct basic_block_vec* self, struct basic_block* basic_block) {
     if (self == NULL) {
         return;
     }
@@ -41,7 +41,7 @@ void basic_block_vector_push(struct basic_block_vector* self, struct basic_block
     self->len += 1;
 }
 
-struct basic_block* basic_block_vector_pop(struct basic_block_vector* self) {
+struct basic_block* basic_block_vec_pop(struct basic_block_vec* self) {
     if ((self == NULL) || (self->len == 0)) {
         return NULL;
     }
