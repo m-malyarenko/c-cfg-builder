@@ -446,7 +446,7 @@ VISITOR(visit_switch_statement) {
     struct cf_node* const default_node = handler->switch_handler.default_node;
     struct cf_node* const last_case_node = handler->switch_handler.last_case_node;
  
-    if ((default_node != 0) && (default_node != last_case_node)) {
+    if ((default_node != NULL) && (default_node != last_case_node)) {
         basic_block_resize_links(last_case_node->node._stmnt->_case->imag_bb, 1);
         basic_block_set_link(last_case_node->node._stmnt->_case->imag_bb, default_node->entry, 0);
     }
