@@ -33,11 +33,12 @@ struct cfg_builder_output build_function_cfg(CXCursor func_cursor) {
         .sink_bb = cfg_sink,
         .cfg_nodes = cfg_nodes,
         .goto_table = goto_table_new(),
+        .switch_handler = { NULL, NULL, NULL },
         .status = CFG_BUILDER_OK,
     };
 
     /* Function traversing entry */
-    // clang_visitChildren(func_cursor, visit_subnode, &handler);
+    clang_visitChildren(func_cursor, visit_subnode, &handler);
 
     basic_block_vec_push(cfg_nodes, cfg_sink);
 
@@ -233,13 +234,10 @@ VISITOR(visit_statement) {
             handler->current_cf_node = cf_stmnt_label_new(handler->parent_cf_node);
             visit_result = visit_label_statement(cursor, parent, handler);
         } break;
+        case CXCursor_DefaultStmt:
         case CXCursor_CaseStmt: {
             handler->current_cf_node = cf_stmnt_case_new(handler->parent_cf_node);
             visit_result = visit_case_statement(cursor, parent, handler);
-        } break;
-        case CXCursor_DefaultStmt: {
-            handler->current_cf_node = cf_stmnt_default_new(handler->parent_cf_node);
-            visit_result = visit_default_statement(cursor, parent, handler);
         } break;
         default: {
             handler->current_cf_node = NULL;
@@ -406,15 +404,16 @@ VISITOR(visit_switch_statement) {
     assert(cursor_kind == CXCursor_SwitchStmt);
 
     struct cursor_vec* children = get_cursor_children(cursor);
-    assert((children->len == 1) || (children->len == 2));
-    const bool has_body = (children->len == 2);
+    assert(children->len == 2);
 
-    struct cf_stmnt_case* const cf_stmnt_switch =
+    struct cf_stmnt_switch* const stmnt_switch =
         handler->current_cf_node->node._stmnt->_switch;
 
     enum CXChildVisitResult visit_result = CXChildVisit_Continue;
 
     struct basic_block* const saved_link_bb = handler->link_bb;
+    struct basic_block* const saved_break_target = handler->break_target;
+    struct basic_block* const saved_continue_target = handler->continue_target;
 
     /* Const expression */
     visit_result = visit_subnode(children->buffer[0], cursor, handler);
@@ -424,11 +423,44 @@ VISITOR(visit_switch_statement) {
         return visit_result;
     }
 
-    cf_stmnt_switch->const_expr = handler->return_cf_node;
+    stmnt_switch->select = handler->return_cf_node;
+    handler->link_bb = saved_link_bb;
+
+    /* Set break jump target */
+    handler->break_target = saved_link_bb;
+    handler->continue_target = NULL;
+
+    /* Body */
+    visit_result = visit_subnode(children->buffer[1], cursor, handler);
+
+    if (visit_result == CXChildVisit_Break) {
+        cursor_vec_drop(&children);
+        return visit_result;
+    }
+
+    stmnt_switch->body = handler->return_cf_node;
+
+    connect_tail(stmnt_switch->select, stmnt_switch->body->entry);
+
+    /* Handle default statemnet */
+    struct cf_node* const default_node = handler->switch_handler.default_node;
+    struct cf_node* const last_case_node = handler->switch_handler.last_case_node;
+ 
+    if ((default_node != 0) && (default_node != last_case_node)) {
+        basic_block_resize_links(last_case_node->node._stmnt->_case->imag_bb, 1);
+        basic_block_set_link(last_case_node->node._stmnt->_case->imag_bb, default_node->entry, 0);
+    }
+
+    handler->current_cf_node->entry = stmnt_switch->select->entry;
+    handler->link_bb = stmnt_switch->select->entry;
+    handler->break_target = saved_break_target;
+    handler->continue_target = saved_continue_target;
+    handler->switch_handler.default_node = NULL;
+    handler->switch_handler.last_case_node = NULL;
 
     cursor_vec_drop(&children);
     
-    return CXChildVisit_Continue;
+    return visit_result;
 }
 
 VISITOR(visit_while_statement) {
@@ -461,10 +493,10 @@ VISITOR(visit_while_statement) {
     handler->link_bb = stmnt_while->cond->entry;
 
     /* Set loop jump targets */
+    handler->break_target = saved_link_bb;
     handler->continue_target = stmnt_while->cond->entry;
 
     /* Body branch */
-    handler->break_target = saved_link_bb;
     visit_result = visit_subnode(children->buffer[1], cursor, handler);
 
     if (visit_result == CXChildVisit_Break) {
@@ -704,30 +736,40 @@ VISITOR(visit_case_statement) {
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
     struct cfg_builder_handler* handler = client_data;
 
-    assert(cursor_kind == CXCursor_CaseStmt);
+    assert((cursor_kind == CXCursor_CaseStmt) || (cursor_kind == CXCursor_DefaultStmt));
+    const bool is_default = (cursor_kind == CXCursor_DefaultStmt);
 
-    return CXChildVisit_Continue;
-}
-
-VISITOR(visit_default_statement) {
-    const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
-    struct cfg_builder_handler* handler = client_data;
-
-    assert(cursor_kind == CXCursor_DefaultStmt);
     struct cursor_vec* children = get_cursor_children(cursor);
-    assert((children->len == 0) || (children->len == 1));
-    const bool has_body = (children->len == 1);
+    if (is_default) {
+        assert((children->len == 0) || (children->len == 1));
+    } else {
+        assert((children->len == 1) || (children->len == 2));
+    }
 
-    struct basic_block* const saved_link_bb = handler->link_bb;
+    const bool has_body = is_default ? (children->len == 1) : (children->len == 2);
+    const size_t body_child_idx = is_default ? 0 : 1;
 
-    struct cf_stmnt_case* const stmnt_default =
-        handler->current_cf_node->node._stmnt->_default;
+    struct cf_stmnt_case* const stmnt_case =
+        handler->current_cf_node->node._stmnt->_case;
 
     enum CXChildVisitResult visit_result = CXChildVisit_Continue;
 
+    struct basic_block* const saved_link_bb = handler->link_bb;
+
     if (has_body) {
         /* Body */
-        handler->link_bb = handler->break_target; // ?
+        visit_result = visit_subnode(children->buffer[body_child_idx], cursor, handler);
+
+        if (visit_result == CXChildVisit_Break) {
+            cursor_vec_drop(&children);
+            return visit_result;
+        }
+
+        stmnt_case->body = handler->return_cf_node;       
+    }
+
+    if (!is_default) {
+        /* Constant expression condition */
         visit_result = visit_subnode(children->buffer[0], cursor, handler);
 
         if (visit_result == CXChildVisit_Break) {
@@ -735,25 +777,50 @@ VISITOR(visit_default_statement) {
             return visit_result;
         }
 
-        stmnt_default->body = handler->return_cf_node;
+        stmnt_case->const_expr = handler->return_cf_node;
     } else {
-        stmnt_default->body = NULL;
+        stmnt_case->const_expr = NULL;
     }
 
-    // TODO Сделать default ветку по мотивам goto: приделать её после последнего case выражения.
+    const bool is_last_case = (handler->switch_handler.last_case_node == NULL);
+    struct basic_block* const next_case_link =
+            is_last_case
+                    ? saved_link_bb
+                    : handler->switch_handler.prev_case_node->entry;
 
-    /* Const expression */
-    visit_result = visit_subnode(children->buffer[0], cursor, handler);
+    push_spelling_to_basic_block(clang_getNullCursor(), stmnt_case->imag_bb); // TODO remove debug info
+    basic_block_resize_links(stmnt_case->imag_bb, 1);
+    basic_block_set_link(stmnt_case->imag_bb, next_case_link, 0);
+    basic_block_vec_push(handler->cfg_nodes, stmnt_case->imag_bb);
 
-    if (visit_result == CXChildVisit_Break) {
-        cursor_vec_drop(&children);
-        return visit_result;
+    if (!is_default) {
+        connect_condition_branches(
+            stmnt_case->const_expr,
+            has_body ? stmnt_case->body->entry : next_case_link,
+            stmnt_case->imag_bb
+        );
+
+        handler->current_cf_node->entry = stmnt_case->const_expr->entry;
+    } else {
+        handler->current_cf_node->entry =
+            has_body
+                ? stmnt_case->body->entry
+                : stmnt_case->imag_bb;
     }
 
-    stmnt_default->const_expr = handler->return_cf_node;
-    handler->current_cf_node->entry = stmnt_default->const_expr->entry;
+    if (is_last_case) {
+        handler->switch_handler.last_case_node = handler->current_cf_node;
+    }
 
-    cursor_vec_drop(&children);
+    if (is_default) {
+        handler->switch_handler.default_node = handler->current_cf_node;
+    } else {
+        handler->switch_handler.prev_case_node = handler->current_cf_node;
+    }
+
+    handler->link_bb = handler->current_cf_node->entry;
+
+    return visit_result;
 }
 
 VISITOR(visit_goto_statement) {
@@ -840,14 +907,6 @@ VISITOR(inspect_children) {
     cursor_vec_push(children, cursor);
 
     return CXChildVisit_Continue;
-}
-
-struct cursor_vec* normalize_switch_body(CXCursor cursor) {
-    const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
-
-    assert(cursor_kind == CXCursor_SwitchStmt);
-
-
 }
 
 void connect_goto_labels(struct goto_table* table) {

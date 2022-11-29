@@ -33,7 +33,15 @@ struct cfg_builder_handler {
     struct basic_block_vec* cfg_nodes;      /** Accumulator for CFG basic blocks */
     struct basic_block* sink_bb;            /** Dummy sink basic block as function terminator */
     struct goto_table* goto_table;          /** Table to connect goto source & destination labels */
-    enum cfg_builder_status status;         /** Status of CFG builer */
+
+    /** Special handler for switch statement */
+    struct {
+        struct cf_node* default_node;       /** Deafult case for switch statement */
+        struct cf_node* last_case_node;     /** Last case statemnt in switch block */
+        struct cf_node* prev_case_node;     /** Previous case node in switch block */
+    } switch_handler;
+
+    enum cfg_builder_status status;         /** Status of CFG builer */                       
 };
 
 /* Entry point */
@@ -72,17 +80,11 @@ VISITOR(visit_return_statement);
 
 VISITOR(visit_case_statement);
 
-VISITOR(visit_default_statement);
-
 VISITOR(visit_goto_statement);
 
 VISITOR(visit_label_statement);
 
 VISITOR(inspect_children);
-
-/* Switch handle */
-
-struct cursor_vec* normalize_switch_body(CXCursor cursor);
 
 /* Goto handle */
 
