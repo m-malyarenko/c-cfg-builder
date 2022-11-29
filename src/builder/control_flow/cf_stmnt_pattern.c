@@ -178,6 +178,7 @@ struct cf_node* cf_stmnt_case_new(struct cf_node* parent) {
 
     new_cf_stmnt_case->const_expr = NULL;
     new_cf_stmnt_case->body = NULL;
+    new_cf_stmnt_case->imag_bb = basic_block_new();
 
     return cf_stmnt_new(CF_STMNT_CASE, new_cf_stmnt_case, parent);
 }
@@ -188,25 +189,6 @@ void cf_stmnt_case_drop(struct cf_stmnt_case** self) {
     }
 
     cf_node_drop(&(*self)->const_expr);
-    cf_node_drop(&(*self)->body);
-
-    free(*self);
-    *self = NULL;
-}
-
-struct cf_node* cf_stmnt_default_new(struct cf_node* parent) {
-    struct cf_stmnt_default* new_cf_stmnt_default = malloc(sizeof(struct cf_stmnt_default));
-
-    new_cf_stmnt_default->body = NULL;
-
-    return cf_stmnt_new(CF_STMNT_DEFAULT, new_cf_stmnt_default, parent);
-}
-
-void cf_stmnt_default_drop(struct cf_stmnt_default** self) {
-    if ((self == NULL) || (*self == NULL)) {
-        return;
-    }
-
     cf_node_drop(&(*self)->body);
 
     free(*self);
@@ -228,7 +210,6 @@ void cf_stmnt_goto_drop(struct cf_stmnt_goto** self) {
     }
 
     str_drop(&(*self)->label);
-    basic_block_drop(&(*self)->imag_bb);
 
     free(*self);
     *self = NULL;

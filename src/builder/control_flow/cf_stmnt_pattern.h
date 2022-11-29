@@ -91,20 +91,12 @@ void cf_stmnt_return_drop(struct cf_stmnt_return** self);
 struct cf_stmnt_case {
     struct cf_node* const_expr;
     struct cf_node* body;
+    struct basic_block* imag_bb;
 };
 
 struct cf_node* cf_stmnt_case_new(struct cf_node* parent);
 
 void cf_stmnt_case_drop(struct cf_stmnt_case** self);
-
-/* Default statement */
-struct cf_stmnt_default {
-    struct cf_node* body;
-};
-
-struct cf_node* cf_stmnt_default_new(struct cf_node* parent);
-
-void cf_stmnt_default_drop(struct cf_stmnt_default** self);
 
 /* Goto statement */
 struct cf_stmnt_goto {

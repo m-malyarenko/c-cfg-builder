@@ -54,9 +54,6 @@ void cf_stmnt_drop(struct cf_stmnt** self) {
         case CF_STMNT_CASE: {
             cf_stmnt_case_drop(&(*self)->_case);
         } break;
-        case CF_STMNT_DEFAULT: {
-            cf_stmnt_default_drop(&(*self)->_default);
-        } break;
         default:
             assert(0 && "Undefined statement type");
     }
