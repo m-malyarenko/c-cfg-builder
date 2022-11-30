@@ -9,6 +9,7 @@
 #include "../utility/spelling.h"
 #include "../entity/basic_block.h"
 #include "../entity/operation.h"
+#include "cfg_sanitizer.h"
 #include "cfg_builder.h"
 
 struct cfg_builder_output build_function_cfg(CXCursor func_cursor) {
@@ -40,22 +41,37 @@ struct cfg_builder_output build_function_cfg(CXCursor func_cursor) {
     /* Function traversing entry */
     clang_visitChildren(func_cursor, visit_subnode, &handler);
 
-    basic_block_vec_push(cfg_nodes, cfg_sink);
-
-    /* CFG post processing */
-    connect_goto_labels(handler.goto_table);
-    goto_table_drop(&handler.goto_table);
-
     if (handler.status != CFG_BUILDER_OK) {
         cf_node_drop(&func);
         basic_block_vec_drop(&cfg_nodes);
+        goto_table_drop(&handler.goto_table);
         return (struct cfg_builder_output) { NULL, NULL };
     }
+
+    struct basic_block* cfg_entry = handler.link_bb;
+
+    /* CFG post processing */
+    connect_goto_labels(handler.goto_table);
+    struct basic_block_vec* sanitized_cfg = NULL;
+    
+    sanitized_cfg = eliminate_empty_basic_blocks(cfg_nodes);
+    basic_block_vec_drop(&cfg_nodes);
+    cfg_nodes = sanitized_cfg;
+
+    sanitized_cfg = merge_linear_basic_blocks(cfg_entry, cfg_sink);
+    basic_block_vec_drop(&cfg_nodes);
+    cfg_nodes = sanitized_cfg;
+
+    /* Add sink node to CFG */
+    basic_block_vec_push(cfg_nodes, cfg_sink);
 
     struct cfg_builder_output output = {
         .cfg_nodes = cfg_nodes,
         .cfg_sink = cfg_sink,
     };
+
+    cf_node_drop(&func);
+    goto_table_drop(&handler.goto_table);
 
     return output;
 }
@@ -97,7 +113,9 @@ VISITOR(visit_subnode) {
 }
 
 VISITOR(visit_expression) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(clang_isExpression(cursor_kind));
@@ -106,7 +124,28 @@ VISITOR(visit_expression) {
     struct cf_expr* const expr = handler->current_cf_node->node._expr;
 
     // TODO Traverse expression tree
-    push_spelling_to_basic_block(cursor, expr->bb);
+    const struct cf_node* parent_node = handler->parent_cf_node;
+    operation_t* expression_op = str_list_new();
+
+    if (parent_node->type == CF_NODE_STMNT) {
+        if ((parent_node->node._stmnt->type == CF_STMNT_SWITCH)
+                && (parent_node->node._stmnt->_switch->select == PENDING_SUBNODE_MARKER))
+        {
+            str_list_push(expression_op, str_new("select = "));
+        } else if ((parent_node->node._stmnt->type == CF_STMNT_CASE)
+                        && (parent_node->node._stmnt->_case->const_expr == PENDING_SUBNODE_MARKER))
+        {
+            str_list_push(expression_op, str_new("select == "));
+        } else if ((parent_node->node._stmnt->type == CF_STMNT_RETURN)
+                        && (parent_node->node._stmnt->_return->return_expr == PENDING_SUBNODE_MARKER))
+        {
+            str_list_push(expression_op, str_new("ret "));
+        }
+    }
+
+    str_list_push(expression_op, get_cursor_range_spelling(cursor));
+
+    basic_block_push_operation(expr->bb, expression_op);
     basic_block_resize_links(expr->bb, 1);
     basic_block_set_link(expr->bb, handler->link_bb, 0);
 
@@ -132,6 +171,10 @@ VISITOR(visit_declaration) {
         return CXChildVisit_Break;
     }
 
+    if (cursor_kind == CXCursor_ParmDecl) {
+        return CXChildVisit_Continue;
+    }
+
     struct cf_decl* const decl = handler->current_cf_node->node._decl;
 
     /* Type name */
@@ -140,27 +183,37 @@ VISITOR(visit_declaration) {
     str_append(decl->type_name, clang_getCString(cursor_type_spelling));
     clang_disposeString(cursor_type_spelling);
 
-    /* Initialization */
-    struct cursor_vec* children = get_cursor_children(cursor);
-    assert((children->len == 1) || (children->len == 0));
-    const bool has_initialization = (children->len == 1);
+    decl->expr = cf_expr_new(handler->current_cf_node);
+    push_spelling_to_basic_block(cursor, decl->expr->node._expr->bb);
+    basic_block_resize_links(decl->expr->node._expr->bb, 1);
+    basic_block_set_link(decl->expr->node._expr->bb, handler->link_bb, 0);
+    basic_block_vec_push(handler->cfg_nodes, decl->expr->node._expr->bb);
 
-    enum CXChildVisitResult visit_result = CXChildVisit_Continue;
+    decl->expr->entry = decl->expr->node._expr->bb;
+    handler->current_cf_node->entry = decl->expr->entry;
+    handler->link_bb = decl->expr->entry;
 
-    if (has_initialization) {
-        visit_result = visit_subnode(children->buffer[0], cursor, handler);
+    // /* Initialization */
+    // struct cursor_vec* children = get_cursor_children(cursor);
+    // assert((children->len == 1) || (children->len == 0));
+    // const bool has_initialization = (children->len == 1);
 
-        decl->expr = handler->return_cf_node;
-    } else {
-        decl->expr = cf_expr_new(handler->current_cf_node);
-    }
+    // enum CXChildVisitResult visit_result = CXChildVisit_Continue;
 
-    handler->current_cf_node->entry =
-        has_initialization
-            ? decl->expr->entry
-            : handler->link_bb;
+    // if (has_initialization) {
+    //     visit_result = visit_subnode(children->buffer[0], cursor, handler);
 
-    return visit_result;
+    //     decl->expr = handler->return_cf_node;
+    // } else {
+    //     decl->expr = cf_expr_new(handler->current_cf_node);
+    // }
+
+    // handler->current_cf_node->entry =
+    //     has_initialization
+    //         ? decl->expr->entry
+    //         : handler->link_bb;
+
+    return CXChildVisit_Continue;
 }
 
 VISITOR(visit_statement) {
@@ -251,7 +304,9 @@ VISITOR(visit_statement) {
 }
 
 VISITOR(visit_compound_statement) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_CompoundStmt);
@@ -293,7 +348,9 @@ VISITOR(visit_compound_statement) {
 }
 
 VISITOR(visit_declaration_statement) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_DeclStmt);
@@ -329,7 +386,9 @@ VISITOR(visit_declaration_statement) {
 }
 
 VISITOR(visit_if_statement) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_IfStmt);
@@ -398,7 +457,9 @@ VISITOR(visit_if_statement) {
 }
 
 VISITOR(visit_switch_statement) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_SwitchStmt);
@@ -416,6 +477,7 @@ VISITOR(visit_switch_statement) {
     struct basic_block* const saved_continue_target = handler->continue_target;
 
     /* Const expression */
+    stmnt_switch->select = PENDING_SUBNODE_MARKER;
     visit_result = visit_subnode(children->buffer[0], cursor, handler);
 
     if (visit_result == CXChildVisit_Break) {
@@ -464,7 +526,9 @@ VISITOR(visit_switch_statement) {
 }
 
 VISITOR(visit_while_statement) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_WhileStmt);
@@ -523,7 +587,9 @@ VISITOR(visit_while_statement) {
 }
 
 VISITOR(visit_do_statement) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_DoStmt);
@@ -582,7 +648,9 @@ VISITOR(visit_do_statement) {
 }
 
 VISITOR(visit_for_statement) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_ForStmt);
@@ -671,7 +739,9 @@ VISITOR(visit_for_statement) {
 }
 
 VISITOR(visit_break_statement) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_BreakStmt);
@@ -683,7 +753,9 @@ VISITOR(visit_break_statement) {
 }
 
 VISITOR(visit_continue_statement) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_ContinueStmt);
@@ -695,7 +767,9 @@ VISITOR(visit_continue_statement) {
 }
 
 VISITOR(visit_return_statement) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_ReturnStmt);
@@ -711,6 +785,7 @@ VISITOR(visit_return_statement) {
     enum CXChildVisitResult visit_result = CXChildVisit_Continue;
 
     if (has_expression) {
+        stmnt_return->return_expr = PENDING_SUBNODE_MARKER;
         visit_result = visit_subnode(children->buffer[0], cursor, handler);
 
         if (visit_result == CXChildVisit_Break) {
@@ -758,6 +833,7 @@ VISITOR(visit_case_statement) {
 
     if (has_body) {
         /* Body */
+        stmnt_case->body = PENDING_SUBNODE_MARKER;
         visit_result = visit_subnode(children->buffer[body_child_idx], cursor, handler);
 
         if (visit_result == CXChildVisit_Break) {
@@ -770,6 +846,7 @@ VISITOR(visit_case_statement) {
 
     if (!is_default) {
         /* Constant expression condition */
+        stmnt_case->const_expr = PENDING_SUBNODE_MARKER;
         visit_result = visit_subnode(children->buffer[0], cursor, handler);
 
         if (visit_result == CXChildVisit_Break) {
@@ -783,12 +860,17 @@ VISITOR(visit_case_statement) {
     }
 
     const bool is_last_case = (handler->switch_handler.last_case_node == NULL);
-    struct basic_block* const next_case_link =
-            is_last_case
-                    ? saved_link_bb
-                    : handler->switch_handler.prev_case_node->entry;
+    struct basic_block* next_case_link = NULL;
 
-    push_spelling_to_basic_block(clang_getNullCursor(), stmnt_case->imag_bb); // TODO remove debug info
+    if (is_last_case) {
+        next_case_link = saved_link_bb;
+    } else {
+        next_case_link =
+            (handler->switch_handler.prev_case_node != NULL)
+                ? handler->switch_handler.prev_case_node->entry
+                : handler->switch_handler.default_node->entry;
+    }
+
     basic_block_resize_links(stmnt_case->imag_bb, 1);
     basic_block_set_link(stmnt_case->imag_bb, next_case_link, 0);
     basic_block_vec_push(handler->cfg_nodes, stmnt_case->imag_bb);
@@ -796,7 +878,7 @@ VISITOR(visit_case_statement) {
     if (!is_default) {
         connect_condition_branches(
             stmnt_case->const_expr,
-            has_body ? stmnt_case->body->entry : next_case_link,
+            has_body ? stmnt_case->body->entry : saved_link_bb,
             stmnt_case->imag_bb
         );
 
@@ -818,13 +900,15 @@ VISITOR(visit_case_statement) {
         handler->switch_handler.prev_case_node = handler->current_cf_node;
     }
 
-    handler->link_bb = handler->current_cf_node->entry;
+    handler->link_bb = has_body ? stmnt_case->body->entry : saved_link_bb;
 
     return visit_result;
 }
 
 VISITOR(visit_goto_statement) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_GotoStmt);
@@ -842,7 +926,6 @@ VISITOR(visit_goto_statement) {
     clang_disposeString(label);
 
     /* Connect imaginary basic block to link */
-    push_spelling_to_basic_block(cursor, stmnt_goto->imag_bb);
     basic_block_resize_links(stmnt_goto->imag_bb, 1);
     basic_block_set_link(stmnt_goto->imag_bb, handler->link_bb, 0);
 
@@ -861,7 +944,9 @@ VISITOR(visit_goto_statement) {
 }
 
 VISITOR(visit_label_statement) {
+    #ifndef NDEBUG
     const enum CXCursorKind cursor_kind = clang_getCursorKind(cursor);
+    #endif
     struct cfg_builder_handler* handler = client_data;
 
     assert(cursor_kind == CXCursor_LabelStmt);
@@ -973,8 +1058,8 @@ void connect_condition_branches(struct cf_node* cond,
 }
 
 void push_spelling_to_basic_block(CXCursor cursor, struct basic_block* bb) {
-    str_t* expression_spelling = get_source_range_spelling(cursor);
-    struct operation* operation = operation_new();
-    operation_push_operand(operation, expression_spelling);
+    str_t* spelling = get_cursor_range_spelling(cursor);
+    operation_t* operation = str_list_with_capacity(1);
+    str_list_push(operation, spelling);
     basic_block_push_operation(bb, operation);
 }
