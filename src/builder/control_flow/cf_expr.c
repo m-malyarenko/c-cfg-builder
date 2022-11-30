@@ -17,8 +17,6 @@ void cf_expr_drop(struct cf_expr** self) {
         return;
     }
 
-    basic_block_drop(&(*self)->bb);
-
     free(*self);
     *self = NULL;
 }
