@@ -3,7 +3,7 @@
 #include <clang-c/Index.h>
 #include <ustring/str.h>
 
-str_t* get_source_range_spelling(CXCursor cursor) {
+str_t* get_cursor_range_spelling(CXCursor cursor) {
     CXTranslationUnit tu = clang_Cursor_getTranslationUnit(cursor);
     CXSourceRange source_range = clang_getCursorExtent(cursor);
 
