@@ -7,6 +7,8 @@
 #include "../../entity/basic_block.h"
 #include "cf_node.h"
 
+#define PENDING_SUBNODE_MARKER ((void*) 0x1)
+
 /* Compound statement */
 struct cf_stmnt_compound {
     struct cf_node_vec* items;
