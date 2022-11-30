@@ -33,7 +33,7 @@ vpath %.h $(INCLUDE_DIR) $(shell find $(SRC_DIR) -type d -printf "%p ")
 # Build type ------------------------------------------------------------------
 
 # Build type: DEBUG, RELEASE
-BUILD_TYPE = DEBUG
+BUILD_TYPE = RELEASE
 
 # Tools -----------------------------------------------------------------------
 
